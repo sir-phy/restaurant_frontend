@@ -1,5 +1,6 @@
 import { io, Socket } from 'socket.io-client'
 import { getAccessToken } from './api.js'
+import { SOCKET_URL } from './config.js'
 
 let socketInstance: Socket | null = null
 
@@ -12,9 +13,7 @@ export const getSocket = (): Socket => {
     }
   }
 
-  const origin = window.location.origin
-
-  socketInstance = io(origin, {
+  socketInstance = io(SOCKET_URL, {
     auth: {
       token: token || ''
     },

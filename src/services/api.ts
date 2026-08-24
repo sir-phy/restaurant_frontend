@@ -1,3 +1,5 @@
+import { API_BASE_URL } from './config.js'
+
 export interface ApiResponse<T = any> {
   message: string
   data?: T
@@ -36,7 +38,12 @@ export async function apiRequest<T = any>(
     headers['Authorization'] = `Bearer ${token}`
   }
 
-  const url = endpoint.startsWith('http') ? endpoint : (endpoint.startsWith('/api') ? endpoint : `/api${endpoint}`)
+  // Resolve the request path, then point it at restaurant_backend (or keep an
+  // already-absolute URL unchanged).
+  const path = endpoint.startsWith('http')
+    ? endpoint
+    : (endpoint.startsWith('/api') ? endpoint : `/api${endpoint}`)
+  const url = path.startsWith('http') ? path : `${API_BASE_URL}${path}`
 
   try {
     const res = await fetch(url, {

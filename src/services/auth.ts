@@ -14,26 +14,51 @@ export interface UserProfile {
 export const currentUser = ref<UserProfile | null>(null)
 export const isAuthenticated = ref<boolean>(!!getAccessToken())
 
+// The backend returns `role` (uppercase) and `status` as the lowercase DB value
+// (e.g. 'active'). Normalize both so the rest of the app sees ACTIVE/INACTIVE.
+const normalizeProfile = (user: any): UserProfile => ({
+  id: Number(user.id),
+  name: user.name,
+  email: user.email,
+  role: String(user.role || 'CUSTOMER').toUpperCase() as UserProfile['role'],
+  role_id: Number(user.role_id ?? 0),
+  status: String(user.status || 'active').toUpperCase() === 'ACTIVE' ? 'ACTIVE' : 'INACTIVE',
+  tableId: user.tableId ?? null,
+})
+
+interface AuthResult {
+  user: UserProfile
+  accessToken: string
+}
+
+const completeAuth = (result: AuthResult): AuthResult => {
+  setAccessToken(result.accessToken)
+  currentUser.value = result.user
+  isAuthenticated.value = true
+  localStorage.setItem('gomeal_auth_user', JSON.stringify(result.user))
+  return result
+}
+
+/**
+ * Authenticates an existing account (staff: manager/cashier/chef) or, when the
+ * caller supplies a CUSTOMER role / table id, provisions a lightweight guest.
+ */
 export const login = async (credentials: { email?: string; password?: string; role?: string; tableId?: number | string; name?: string }) => {
-  const res = await api.post<{ user: UserProfile; accessToken: string }>('/auth/login', credentials)
+  const isGuest = credentials.role?.toUpperCase() === 'CUSTOMER' || (!credentials.email && credentials.tableId !== undefined)
+  const res = isGuest
+    ? await api.post<AuthResult>('/auth/guest', { name: credentials.name, tableId: credentials.tableId })
+    : await api.post<AuthResult>('/auth/login', { email: credentials.email, password: credentials.password })
+
   if (res.data) {
-    setAccessToken(res.data.accessToken)
-    currentUser.value = res.data.user
-    isAuthenticated.value = true
-    localStorage.setItem('gomeal_auth_user', JSON.stringify(res.data.user))
-    return res.data
+    return completeAuth({ ...res.data, user: normalizeProfile(res.data.user) })
   }
   throw new Error('Login failed')
 }
 
-export const register = async (data: { email: string; password: string; role?: string }) => {
-  const res = await api.post<{ user: UserProfile; accessToken: string }>('/auth/register', data)
+export const register = async (data: { name: string; email: string; password: string; role?: string }) => {
+  const res = await api.post<AuthResult>('/auth/register', data)
   if (res.data) {
-    setAccessToken(res.data.accessToken)
-    currentUser.value = res.data.user
-    isAuthenticated.value = true
-    localStorage.setItem('gomeal_auth_user', JSON.stringify(res.data.user))
-    return res.data
+    return completeAuth({ ...res.data, user: normalizeProfile(res.data.user) })
   }
   throw new Error('Registration failed')
 }
@@ -49,10 +74,10 @@ export const fetchMe = async (): Promise<UserProfile | null> => {
   try {
     const res = await api.get<UserProfile>('/auth/me')
     if (res.data) {
-      currentUser.value = res.data
+      currentUser.value = normalizeProfile(res.data)
       isAuthenticated.value = true
-      localStorage.setItem('gomeal_auth_user', JSON.stringify(res.data))
-      return res.data
+      localStorage.setItem('gomeal_auth_user', JSON.stringify(normalizeProfile(res.data)))
+      return currentUser.value
     }
   } catch (e) {
     console.warn('Failed to verify user profile with server:', e)

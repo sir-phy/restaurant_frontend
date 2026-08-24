@@ -2,7 +2,7 @@
 import { ref, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { t, currentLang, setLang } from '../i18n'
-import { register } from '../services/auth'
+import { register, login } from '../services/auth'
 
 const router = useRouter()
 const route = useRoute()
@@ -88,11 +88,21 @@ const handleRegister = async () => {
 
   isLoading.value = true
   try {
-    const result = await register({
-      email: cleanEmail,
-      password: password.value,
-      role: 'customer'
-    })
+    let result
+
+    // First try to authenticate an existing account (staff demo presets /
+    // previously registered accounts). If the account does not exist yet,
+    // fall back to self-registering a CUSTOMER on the backend.
+    try {
+      result = await login({ email: cleanEmail, password: password.value })
+    } catch (loginErr: any) {
+      result = await register({
+        name: cleanEmail.split('@')[0] || cleanEmail,
+        email: cleanEmail,
+        password: password.value,
+        role: 'customer'
+      })
+    }
 
     // Role-Based routing based on authenticated identity
     const userRole = result.user.role
