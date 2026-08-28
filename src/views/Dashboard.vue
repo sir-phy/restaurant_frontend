@@ -2,6 +2,8 @@
 import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import * as d3 from 'd3'
 import { t, currentLang, translateDishName, translateDishDesc, translateIngredient } from '../i18n'
+import { menuService } from '../services/menu.js'
+import { getAccessToken } from '../services/api.js'
 
 const translateCategoryName = (name: string): string => {
   if (currentLang.value === 'km') {
@@ -114,16 +116,6 @@ const dynamicStats = computed(() => {
 })
 
 // === MENU MANAGEMENT STATE & LOGIC ===
-const defaultCategories = [
-  { name: 'All Menu', icon: 'grid_view', active: true },
-  { name: 'Bakery', icon: 'bakery_dining', active: false },
-  { name: 'Burger', icon: 'lunch_dining', active: false },
-  { name: 'Beverage', icon: 'local_cafe', active: false },
-  { name: 'Chicken', icon: 'restaurant', active: false },
-  { name: 'Pizza', icon: 'local_pizza', active: false },
-  { name: 'Seafood', icon: 'set_meal', active: false }
-]
-
 const loadCategories = () => {
   const stored = localStorage.getItem('gomeal_categories')
   if (stored) {
@@ -142,7 +134,7 @@ const loadCategories = () => {
       console.error('Error loading custom categories:', e)
     }
   }
-  return defaultCategories
+  return [{ name: 'All Menu', icon: 'grid_view', active: true }]
 }
 
 const categories = ref(loadCategories())
@@ -154,102 +146,6 @@ const selectCategory = (catName: string) => {
     cat.active = cat.name.toLowerCase() === catName.toLowerCase()
   })
 }
-
-const defaultMenuItems = [
-  {
-    id: 1,
-    name: 'Cheese Burger',
-    price: 12.50,
-    category: 'Burger',
-    description: 'Classic beef patty with double cheddar cheese and secret sauce.',
-    ingredients: [
-      { name: 'Beef Patty', amount: 1, unit: 'pcs' },
-      { name: 'Double Cheddar', amount: 2, unit: 'pcs' },
-      { name: 'Lettuce', amount: 0.1, unit: 'kg' },
-      { name: 'Tomato', amount: 0.05, unit: 'kg' },
-      { name: 'Pickles', amount: 3, unit: 'pcs' }
-    ],
-    status: 'Available',
-    image: 'https://images.unsplash.com/photo-1568901346375-23c9450c58cd?auto=format&fit=crop&q=80&w=400'
-  },
-  {
-    id: 2,
-    name: 'Pepperoni Pizza',
-    price: 18.99,
-    category: 'Pizza',
-    description: 'Thin crust loaded with spicy pepperoni and fresh basil leaves.',
-    ingredients: [
-      { name: 'Pepperoni', amount: 0.15, unit: 'kg' },
-      { name: 'Mozzarella', amount: 0.25, unit: 'kg' },
-      { name: 'Tomato Sauce', amount: 0.1, unit: 'kg' },
-      { name: 'Basil', amount: 5, unit: 'pcs' }
-    ],
-    status: 'Available',
-    image: 'https://images.unsplash.com/photo-1513104890138-7c749659a591?auto=format&fit=crop&q=80&w=400'
-  },
-  {
-    id: 3,
-    name: 'Japanese Ramen',
-    price: 15.00,
-    category: 'Seafood',
-    description: 'Creamy pork broth with handmade noodles and chashu pork.',
-    ingredients: [
-      { name: 'Pork Chashu', amount: 2, unit: 'pcs' },
-      { name: 'Ramen Noodles', amount: 0.2, unit: 'kg' },
-      { name: 'Soft Boiled Egg', amount: 1, unit: 'pcs' },
-      { name: 'Nori', amount: 2, unit: 'pcs' }
-    ],
-    status: 'Sold Out',
-    lowStock: true,
-    image: 'https://images.unsplash.com/photo-1569718212165-3a8278d5f624?auto=format&fit=crop&q=80&w=405'
-  },
-  {
-    id: 4,
-    name: 'Fried Rice',
-    price: 10.45,
-    category: 'Chicken',
-    description: 'Wok-fried rice with assorted vegetables and authentic spices.',
-    ingredients: [
-      { name: 'Rice', amount: 0.3, unit: 'kg' },
-      { name: 'Shrimp', amount: 8, unit: 'pcs' },
-      { name: 'Eggs', amount: 2, unit: 'pcs' },
-      { name: 'Green Beans', amount: 0.05, unit: 'kg' },
-      { name: 'Carrots', amount: 0.05, unit: 'kg' }
-    ],
-    status: 'Available',
-    image: 'https://images.unsplash.com/photo-1603133872878-684f208fb84b?auto=format&fit=crop&q=80&w=400'
-  },
-  {
-    id: 5,
-    name: 'Vegan Salad',
-    price: 13.20,
-    category: 'Bakery',
-    description: 'Fresh organic garden greens with avocado and citrus dressing.',
-    ingredients: [
-      { name: 'Avocado', amount: 1, unit: 'pcs' },
-      { name: 'Quinoa', amount: 0.1, unit: 'kg' },
-      { name: 'Baby Spinach', amount: 0.15, unit: 'kg' },
-      { name: 'Citrus Dressing', amount: 2, unit: 'portions' }
-    ],
-    status: 'Available',
-    image: 'https://images.unsplash.com/photo-1512621776951-a57141f2eefd?auto=format&fit=crop&q=80&w=400'
-  },
-  {
-    id: 6,
-    name: 'Berry Smoothie',
-    price: 7.50,
-    category: 'Beverage',
-    description: 'Antioxidant rich blend of blueberries, strawberries and almond milk.',
-    ingredients: [
-      { name: 'Blueberries', amount: 0.08, unit: 'kg' },
-      { name: 'Strawberries', amount: 0.12, unit: 'kg' },
-      { name: 'Almond Milk', amount: 0.25, unit: 'kg' },
-      { name: 'Chia Seeds', amount: 1, unit: 'portions' }
-    ],
-    status: 'Available',
-    image: 'https://images.unsplash.com/photo-1553530593-90056680cd94?auto=format&fit=crop&q=80&w=400'
-  }
-]
 
 const loadMenuItems = () => {
   const stored = localStorage.getItem('gomeal_menu_items')
@@ -269,7 +165,7 @@ const loadMenuItems = () => {
       console.error('Error loading menu items:', e)
     }
   }
-  return defaultMenuItems
+  return []
 }
 
 const menuItems = ref(loadMenuItems())
@@ -277,6 +173,61 @@ const menuItems = ref(loadMenuItems())
 watch(menuItems, () => {
   localStorage.setItem('gomeal_menu_items', JSON.stringify(menuItems.value))
 }, { deep: true })
+
+// Fetch the latest categories + menu items straight from the backend database
+// so the dashboard shows only what is actually stored (no hard-coded defaults).
+const refreshMenuFromBackend = async () => {
+  try {
+    const catRes = await menuService.getCategories()
+    if (catRes.data && Array.isArray(catRes.data) && catRes.data.length > 0) {
+      const cats = catRes.data.map((c: any) => ({
+        name: c.name,
+        icon: c.icon || 'restaurant',
+        active: c.name.toLowerCase() === activeCategory.value.toLowerCase()
+      }))
+      const hasAll = cats.some((c: any) => c.name.toLowerCase() === 'all menu')
+      if (!hasAll) {
+        cats.unshift({ name: 'All Menu', icon: 'grid_view', active: activeCategory.value.toLowerCase() === 'all menu' })
+      }
+      categories.value = cats
+    }
+
+    const itemsRes = await menuService.getMenuItems()
+    if (itemsRes.data && Array.isArray(itemsRes.data) && itemsRes.data.length > 0) {
+      menuItems.value = itemsRes.data.map((i: any) => ({
+        id: i.id,
+        name: i.name,
+        price: Number(i.price),
+        category: i.category?.name || i.category_name || 'General',
+        description: i.description || '',
+        ingredients: (i.ingredients || []).map((ing: any) => ({
+          name: ing.name,
+          amount: ing.amount,
+          unit: ing.unit
+        })),
+        status: statusToDisplay(i.status || 'AVAILABLE'),
+        image: i.image
+      }))
+    } else {
+      menuItems.value = []
+    }
+  } catch (err) {
+    console.log('Backend menu data load notice:', err)
+  }
+}
+
+// Toast feedback
+const toastMessage = ref<string | null>(null)
+const toastType = ref<'success' | 'error'>('success')
+let toastTimer: ReturnType<typeof setTimeout> | null = null
+const showToast = (msg: string, type: 'success' | 'error' = 'success') => {
+  toastMessage.value = msg
+  toastType.value = type
+  if (toastTimer) clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => {
+    toastMessage.value = null
+  }, 4000)
+}
 
 const selectedItems = ref<number[]>([])
 const isEditModalOpen = ref(false)
@@ -512,16 +463,149 @@ const removeIngredient = (index: number) => {
   editingItem.value.ingredients.splice(index, 1)
 }
 
-const saveItem = () => {
-  if (isAddingItem.value) {
-    menuItems.value.unshift({ ...editingItem.value })
-  } else {
-    const index = menuItems.value.findIndex((i: any) => i.id === editingItem.value.id)
-    if (index > -1) {
-      menuItems.value[index] = { ...editingItem.value }
+// ── Backend DB integration for saving menu items ─────────────────────────
+let backendCategories: any[] | null = null
+let backendIngredients: any[] | null = null
+
+const loadBackendCategories = async (): Promise<any[]> => {
+  if (backendCategories) return backendCategories
+  const res = await menuService.getCategories()
+  backendCategories = Array.isArray(res.data) ? res.data : []
+  return backendCategories
+}
+
+// Map the dashboard's display category name -> a real backend category id,
+// creating the category in the DB first if it doesn't exist yet.
+const ensureCategoryId = async (displayName: string): Promise<number> => {
+  const name = (displayName || '').trim() || 'General'
+  const cats = await loadBackendCategories()
+  const found = cats.find((c: any) => c.name?.toLowerCase() === name.toLowerCase())
+  if (found) return Number(found.id)
+  const created = await menuService.createCategory({ name, status: 'ACTIVE' })
+  backendCategories = null // invalidate cache
+  return Number(created?.data?.id)
+}
+
+const loadBackendIngredients = async (): Promise<any[]> => {
+  if (backendIngredients) return backendIngredients
+  const res = await menuService.getIngredients()
+  backendIngredients = Array.isArray(res.data) ? res.data : []
+  return backendIngredients
+}
+
+// The dashboard stores ingredients as {name, amount, unit}; the backend needs
+// {ingredientId, amount, unit}. Resolve each name to its DB id, creating the
+// ingredient first if needed.
+const resolveIngredients = async (
+  ingredients: any[],
+): Promise<Array<{ ingredientId: number; amount: number; unit: string }>> => {
+  if (!ingredients || ingredients.length === 0) return []
+  const ingList = await loadBackendIngredients()
+  const result: Array<{ ingredientId: number; amount: number; unit: string }> = []
+  for (const ing of ingredients) {
+    const name = (typeof ing === 'string' ? ing : ing.name || '').trim()
+    if (!name) continue
+    const unit = ing.unit || 'pcs'
+    const amount = Number(ing.amount || 1)
+    let found = ingList.find((i: any) => i.name?.toLowerCase() === name.toLowerCase())
+    if (!found) {
+      const created = await menuService.createIngredient({ name, unit, status: 'ACTIVE' })
+      found = created?.data
+      if (found) ingList.push(found)
+    }
+    if (found) {
+      result.push({ ingredientId: Number(found.id), amount, unit })
     }
   }
-  isEditModalOpen.value = false
+  return result
+}
+
+const statusToBackend = (s: string): 'AVAILABLE' | 'SOLD_OUT' | 'INACTIVE' => {
+  const v = (s || '').toLowerCase().replace(/\s+/g, '_')
+  if (v === 'sold_out') return 'SOLD_OUT'
+  if (v === 'inactive') return 'INACTIVE'
+  return 'AVAILABLE'
+}
+
+const statusToDisplay = (s: string): string => {
+  const v = (s || '').toUpperCase()
+  if (v === 'SOLD_OUT') return 'Sold Out'
+  if (v === 'INACTIVE') return 'Inactive'
+  return 'Available'
+}
+
+const saveItem = async () => {
+  const item = editingItem.value
+  const name = (item.name || '').trim()
+  if (!name) {
+    showToast('Item name is required', 'error')
+    return
+  }
+  const price = Number(item.price)
+  if (Number.isNaN(price) || price < 0) {
+    showToast('Please enter a valid price', 'error')
+    return
+  }
+  // Saving touches the database, which is Manager-only on the backend.
+  if (!getAccessToken()) {
+    showToast('Please log in as a Manager to save menu items.', 'error')
+    return
+  }
+
+  try {
+    // Resolve display fields to their backend foreign keys.
+    const category_id = await ensureCategoryId(item.category)
+    const ingredients = await resolveIngredients(item.ingredients)
+
+    const payload = {
+      category_id,
+      name,
+      description: item.description || '',
+      price,
+      calories: item.calories ? Number(item.calories) : undefined,
+      image: item.image || undefined,
+      status: statusToBackend(item.status),
+      ingredients,
+    }
+
+    if (isAddingItem.value) {
+      // Insert the new item into the database.
+      const res = await menuService.createMenuItem(payload)
+      const created = res.data as any
+      menuItems.value.unshift({
+        id: created?.id ?? Date.now(),
+        name,
+        price,
+        category: (item.category || '').trim() || 'General',
+        description: item.description || '',
+        ingredients: created?.ingredients?.length ? created.ingredients : (item.ingredients || []),
+        status: statusToDisplay(created?.status || 'AVAILABLE'),
+        image: created?.image ?? item.image,
+      })
+      showToast('Item added to the menu ✓', 'success')
+    } else {
+      // Persist updates for an existing item.
+      await menuService.updateMenuItem(item.id, payload)
+      const index = menuItems.value.findIndex((i: any) => i.id === item.id)
+      if (index > -1) {
+        menuItems.value[index] = {
+          ...editingItem.value,
+          category: (item.category || '').trim() || 'General',
+        }
+      }
+      showToast('Item updated ✓', 'success')
+    }
+
+    isEditModalOpen.value = false
+  } catch (err: any) {
+    const msg = err?.message || 'Failed to save item'
+    const isAuthError =
+      /login|authorize|forbidden|401|403|token/i.test(msg)
+    showToast(
+      isAuthError ? 'Please log in as a Manager to save menu items.' : msg,
+      'error',
+    )
+  }
 }
 
 const renderChart = () => {
@@ -655,6 +739,7 @@ onMounted(() => {
   loadPayoutHistory()
   categories.value = loadCategories()
   menuItems.value = loadMenuItems()
+  refreshMenuFromBackend()
   
   // Real-time listener for across-tab updates
   window.addEventListener('storage', (e) => {
@@ -665,17 +750,18 @@ onMounted(() => {
       loadPayoutHistory()
     }
     if (e.key === 'gomeal_menu_items') {
-      menuItems.value = loadMenuItems()
+      refreshMenuFromBackend()
     }
     if (e.key === 'gomeal_categories') {
-      categories.value = loadCategories()
+      refreshMenuFromBackend()
     }
   })
   
   const syncInterval = setInterval(() => {
     loadLiveCustomerOrders()
     loadPayoutHistory()
-  }, 1500)
+    refreshMenuFromBackend()
+  }, 3000)
 
   renderChart()
   resizeObserver = new ResizeObserver(() => {
@@ -1350,6 +1436,19 @@ watch(currentLang, () => {
         </button>
       </div>
     </transition>
+
+    <!-- Toast feedback -->
+    <div
+      v-if="toastMessage"
+      :class="toastType === 'error' ? 'bg-rose-700 border-rose-500' : 'bg-emerald-700 border-emerald-500'"
+      class="fixed bottom-8 right-8 z-[70] text-white px-5 py-3.5 rounded-2xl shadow-2xl border flex items-center gap-3 text-sm font-bold max-w-sm"
+    >
+      <span class="material-symbols-outlined text-lg">{{ toastType === 'error' ? 'error' : 'check_circle' }}</span>
+      <span class="flex-1">{{ toastMessage }}</span>
+      <button @click="toastMessage = null" class="text-white/60 hover:text-white transition-colors shrink-0">
+        <span class="material-symbols-outlined text-base">close</span>
+      </button>
+    </div>
   </div>
 </template>
 

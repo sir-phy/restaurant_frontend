@@ -877,6 +877,51 @@ const syncMenuData = () => {
   menuItems.value = loadMenuItems()
 }
 
+// Pull the latest categories + menu items straight from the backend DB so any
+// item added in the Dashboard's Menu Management shows up here automatically.
+const refreshMenuFromBackend = async () => {
+  try {
+    const catRes = await menuService.getCategories()
+    if (catRes.data && Array.isArray(catRes.data) && catRes.data.length > 0) {
+      const cats = catRes.data.map((c: any) => ({
+        name: c.name,
+        icon: c.icon || 'restaurant',
+        active: c.name.toLowerCase() === activeCategory.value.toLowerCase()
+      }))
+      const hasAll = cats.some((c: any) => c.name.toLowerCase() === 'all menu')
+      if (!hasAll) {
+        cats.unshift({ name: 'All Menu', icon: 'grid_view', active: activeCategory.value.toLowerCase() === 'all menu' })
+      }
+      categories.value = cats
+    }
+
+    const itemsRes = await menuService.getMenuItems()
+    if (itemsRes.data && Array.isArray(itemsRes.data) && itemsRes.data.length > 0) {
+      menuItems.value = itemsRes.data.map((i: any) => {
+        // Backend uses uppercase statuses (AVAILABLE / SOLD_OUT / INACTIVE), but
+        // the Menu template checks for 'Available' / 'Sold Out' / 'Inactive'.
+        const raw = (i.status || '').toUpperCase()
+        const status = raw === 'SOLD_OUT' ? 'Sold Out' : raw === 'INACTIVE' ? 'Inactive' : 'Available'
+        return {
+          id: i.id,
+          name: i.name,
+          price: i.price,
+          description: i.description || '',
+          ingredients: (i.ingredients || []).map((ing: any) => ({
+            name: ing.name,
+            amount: ing.amount,
+            unit: ing.unit
+          })),
+          status,
+          image: i.image
+        }
+      })
+    }
+  } catch (loadErr) {
+    console.log('Backend menu data load notice:', loadErr)
+  }
+}
+
 onMounted(async () => {
   syncMenuData()
   window.addEventListener('storage', syncMenuData)
@@ -895,40 +940,7 @@ onMounted(async () => {
   }
 
   // Load latest categories and menu items from backend API
-  try {
-    const catRes = await menuService.getCategories()
-    if (catRes.data && Array.isArray(catRes.data) && catRes.data.length > 0) {
-      const cats = catRes.data.map((c: any) => ({
-        name: c.name,
-        icon: c.icon || 'restaurant',
-        active: c.name.toLowerCase() === activeCategory.value.toLowerCase()
-      }))
-      const hasAll = cats.some((c: any) => c.name.toLowerCase() === 'all menu')
-      if (!hasAll) {
-        cats.unshift({ name: 'All Menu', icon: 'grid_view', active: activeCategory.value.toLowerCase() === 'all menu' })
-      }
-      categories.value = cats
-    }
-
-    const itemsRes = await menuService.getMenuItems()
-    if (itemsRes.data && Array.isArray(itemsRes.data) && itemsRes.data.length > 0) {
-      menuItems.value = itemsRes.data.map((i: any) => ({
-        id: i.id,
-        name: i.name,
-        price: i.price,
-        description: i.description || '',
-        ingredients: (i.ingredients || []).map((ing: any) => ({
-          name: ing.name,
-          amount: ing.amount,
-          unit: ing.unit
-        })),
-        status: i.status || 'Available',
-        image: i.image
-      }))
-    }
-  } catch (loadErr) {
-    console.log('Backend menu data load notice:', loadErr)
-  }
+  await refreshMenuFromBackend()
 
   // Real-Time Socket.IO connection and Table Room
   try {
@@ -952,7 +964,11 @@ onMounted(async () => {
     console.log('Socket listener notice:', socketErr)
   }
 
-  const interval = setInterval(syncMenuData, 2500)
+  // Poll backend so menu items added in Menu Management appear without reload.
+  const interval = setInterval(() => {
+    syncMenuData()
+    refreshMenuFromBackend()
+  }, 2500)
   onUnmounted(() => {
     clearInterval(interval)
     window.removeEventListener('storage', syncMenuData)
