@@ -6,7 +6,8 @@ export const authRouter = Router()
 
 // POST /api/auth/register — public
 authRouter.post('/register', (req: Request, res: Response) => {
-  const { email, password, role } = req.body
+  // `role` is intentionally ignored — registration always creates a CUSTOMER.
+  const { email, password } = req.body
 
   if (!email || !email.trim() || !password || !password.trim()) {
     return res.status(400).json({
@@ -50,26 +51,17 @@ authRouter.post('/register', (req: Request, res: Response) => {
     })
   }
 
-  const roleRaw = (role || 'CUSTOMER').toString().toUpperCase()
-  const normalizedRole: 'MANAGER' | 'CASHIER' | 'CHEF' | 'CUSTOMER' = 
-    roleRaw === 'OWNER' || roleRaw === 'MANAGER' ? 'MANAGER' :
-    roleRaw === 'CASHIER' ? 'CASHIER' :
-    roleRaw === 'CHEF' ? 'CHEF' : 'CUSTOMER'
-
-  const roleIdMap: Record<string, number> = {
-    MANAGER: 1,
-    CASHIER: 2,
-    CHEF: 3,
-    CUSTOMER: 4
-  }
-
+  // Public self-registration always provisions a CUSTOMER account.
+  // Staff roles (MANAGER / CASHIER / CHEF) are created by a manager in
+  // User Management — mirrors restaurant_backend's registration guard,
+  // so nobody can sign themselves up as an admin via this endpoint.
   const newUser: User = {
     id: Date.now(),
     name: cleanEmail.split('@')[0],
     email: cleanEmail,
     passwordHash: password,
-    role: normalizedRole,
-    role_id: roleIdMap[normalizedRole] || 4,
+    role: 'CUSTOMER',
+    role_id: 4,
     status: 'ACTIVE'
   }
 

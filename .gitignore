@@ -1,8 +1,34 @@
-node_modules/
-build/
-dist/
-coverage/
-.DS_Store
-*.log
-.env*
+# ── Secrets ─────────────────────────────────────────────────────────────────
+# Never commit environment files containing real credentials.
+.env
+.env.*
+.env.local
+.env.production
 !.env.example
+
+# ── Dependencies ────────────────────────────────────────────────────────────
+node_modules/
+
+# ── Build output / caches ─────────────────────────────────────────────────────
+dist/
+build/
+out/
+.vite/
+*.tsbuildinfo
+
+# ── Logs ────────────────────────────────────────────────────────────────────
+*.log
+npm-debug.log*
+yarn-error.log
+pnpm-debug.log*
+
+# ── OS / editor ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# ── Test artifacts ──────────────────────────────────────────────────────────
+coverage/
