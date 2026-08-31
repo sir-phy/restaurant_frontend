@@ -17,6 +17,7 @@ export interface KitchenQueueItem {
     name: string
     quantity: number
     image?: string
+    unitPrice?: number
     customizations: any[]
     customizationNote: string
   }>

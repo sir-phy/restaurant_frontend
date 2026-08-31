@@ -323,6 +323,7 @@ const openPersonalize = (item: any) => {
         return { name: ing, amount: 1, unit: 'pcs', originalAmount: 1 }
       }
       return { 
+        ingredientId: Number(ing.ingredientId || ing.id || 0),
         name: ing.name, 
         amount: ing.amount, 
         unit: ing.unit,
@@ -388,6 +389,29 @@ const resolveAndJoinTableRoom = async () => {
   } catch (joinErr) {
     console.log('Table room join notice:', joinErr)
   }
+}
+
+const ensureGuestSession = async () => {
+  if (!getAccessToken()) {
+    await login({
+      role: 'Customer',
+      name: guestName.value || `Guest at Table ${currentTable.value}`,
+      tableId: currentTable.value,
+    })
+  }
+}
+
+const placeBackendOrder = async (items: Array<{
+  menuItemId: number
+  quantity: number
+  customizations?: Array<{ ingredientId: number; amount: number }>
+}>) => {
+  await ensureGuestSession()
+  await resolveAndJoinTableRoom()
+  const tableId = tableNumericId.value ?? currentTable.value
+  const res = await orderService.createOrder({ tableId, items })
+  await resolveAndJoinTableRoom()
+  return res.data
 }
 
 const loadOrders = () => {
@@ -1219,33 +1243,30 @@ const checkoutProductDirectly = async (item: any, withCustomization: boolean = f
       }))
   }
   
-  // Send order to backend API
+  // Send order to backend API so the kitchen receives it over Socket.IO
   try {
-    const orderPayload = {
-      tableId: currentTable.value,
-      items: [
-        {
-          menuItemId: item.id || 1,
-          quantity: qty,
-          customizations: personalizedIngredients.value
-            .filter(i => i.amount !== i.originalAmount)
-            .map(i => ({
-              ingredientId: 1,
-              name: i.name,
-              originalAmount: i.originalAmount,
-              amount: i.amount,
-              unit: i.unit,
-              difference: +(i.amount - i.originalAmount).toFixed(2),
-              isIncrease: i.amount > i.originalAmount
-            })),
-          customizationNote: customStr
-        }
-      ]
-    }
-    await orderService.createOrder(orderPayload)
-    await resolveAndJoinTableRoom()
-  } catch (apiErr) {
-    console.log('Order API dispatch notice:', apiErr)
+    const customizations = withCustomization
+      ? personalizedIngredients.value
+          .filter((i: any) => i.amount !== i.originalAmount && Number(i.ingredientId) > 0)
+          .map((i: any) => ({
+            ingredientId: Number(i.ingredientId),
+            amount: Number(i.amount),
+          }))
+      : undefined
+    await placeBackendOrder([
+      {
+        menuItemId: item.id,
+        quantity: qty,
+        customizations: customizations && customizations.length ? customizations : undefined,
+      },
+    ])
+  } catch (apiErr: any) {
+    orderSuccessMessage.value = currentLang.value === 'km'
+      ? `មិនអាចរក្សាទុកការកុម្ម៉ង់បានទេ៖ ${apiErr?.message || 'សូមព្យាយាមម្តងទៀត'}`
+      : `Could not save this order: ${apiErr?.message || 'Please try again'}`
+    isOrderSuccessToastVisible.value = true
+    setTimeout(() => { isOrderSuccessToastVisible.value = false }, 5000)
+    return
   }
 
   clearTableSettled()
@@ -1297,24 +1318,23 @@ const checkoutComboDirectly = async (pairing: Pairing) => {
   const qty = 1
 
   try {
-    await orderService.createOrder({
-      tableId: currentTable.value,
-      items: [
-        {
-          menuItemId: pairing.left.id,
-          quantity: qty,
-          customizationNote: `Combo: ${pairing.name}`,
-        },
-        {
-          menuItemId: pairing.right.id,
-          quantity: qty,
-          customizationNote: `Combo: ${pairing.name}`,
-        },
-      ],
-    })
-    await resolveAndJoinTableRoom()
-  } catch (apiErr) {
-    console.log('Combo API notice:', apiErr)
+    await placeBackendOrder([
+      {
+        menuItemId: pairing.left.id,
+        quantity: qty,
+      },
+      {
+        menuItemId: pairing.right.id,
+        quantity: qty,
+      },
+    ])
+  } catch (apiErr: any) {
+    orderSuccessMessage.value = currentLang.value === 'km'
+      ? `មិនអាចរក្សាទុកឈុតបានទេ៖ ${apiErr?.message || 'សូមព្យាយាមម្តងទៀត'}`
+      : `Could not save this combo: ${apiErr?.message || 'Please try again'}`
+    isOrderSuccessToastVisible.value = true
+    setTimeout(() => { isOrderSuccessToastVisible.value = false }, 5000)
+    return
   }
 
   clearTableSettled()
@@ -1460,6 +1480,7 @@ const refreshMenuFromBackend = async () => {
           price: Number(i.price),
           description: i.description || '',
           ingredients: (i.ingredients || []).map((ing: any) => ({
+            ingredientId: Number(ing.id || ing.ingredientId || 0),
             name: ing.name,
             amount: ing.amount,
             unit: ing.unit

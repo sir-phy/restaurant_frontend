@@ -3,9 +3,9 @@ import { ref, onMounted, onUnmounted, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { t, currentLang, setLang, translateDishName, translateIngredient } from '../i18n'
 import { kitchenService, KitchenQueueItem } from '../services/kitchen.js'
-import { getSocket } from '../services/socket.js'
-import { getAccessToken, setAccessToken } from '../services/api.js'
-import { login, logout } from '../services/auth.js'
+import { getSocket, disconnectSocket, joinKitchenRoom } from '../services/socket.js'
+import { getAccessToken } from '../services/api.js'
+import { login, logout, fetchMe, currentUser } from '../services/auth.js'
 import { resolveMediaUrl } from '../services/config.js'
 
 const router = useRouter()
@@ -46,6 +46,21 @@ const searchQuery = ref<string>('')
 const alertToastMessage = ref<string>('')
 const isToastVisible = ref<boolean>(false)
 const currentTime = ref<number>(Date.now())
+const dishPreview = ref<{ src: string; name: string } | null>(null)
+
+const openDishPreview = (order: OrderItem) => {
+  const src = resolveMediaUrl(order.image)
+  if (!src) return
+  dishPreview.value = { src, name: order.name }
+}
+
+const closeDishPreview = () => {
+  dishPreview.value = null
+}
+
+const onDishPreviewKeydown = (event: KeyboardEvent) => {
+  if (event.key === 'Escape') closeDishPreview()
+}
 
 const showToast = (message: string) => {
   alertToastMessage.value = message
@@ -55,34 +70,49 @@ const showToast = (message: string) => {
   }, 4000)
 }
 
+const ensureChefSession = async () => {
+  let user = currentUser.value
+  if (!user && getAccessToken()) {
+    user = await fetchMe()
+  }
+  if (user?.role !== 'CHEF' && user?.role !== 'MANAGER') {
+    disconnectSocket()
+    await login({ email: 'chef@example.com', password: 'password' })
+  }
+}
+
+const mapKitchenStatus = (
+  status: string,
+): 'Preparing' | 'Sent to Kitchen' | 'Served' => {
+  const s = String(status || '').toUpperCase()
+  if (s === 'PREPARING') return 'Sent to Kitchen'
+  if (s === 'READY' || s === 'SERVED') return 'Served'
+  return 'Preparing'
+}
+
 const loadOrders = async () => {
   try {
-    // Ensure auth token exists for chef
-    if (!getAccessToken()) {
-      await login({ email: 'chef@example.com', password: 'password' })
-    }
+    await ensureChefSession()
 
-    const res = await kitchenService.getQueue()
-    if (res.data && Array.isArray(res.data) && res.data.length > 0) {
+    const res = await kitchenService.getQueue({ limit: 100 })
+    if (Array.isArray(res.data)) {
       const mapped: OrderItem[] = []
       res.data.forEach((qItem: KitchenQueueItem) => {
         const orderTable = qItem.table?.tableNumber || String(qItem.tableId) || '12B'
-        const orderStatus: 'Preparing' | 'Sent to Kitchen' | 'Served' = 
-          qItem.status === 'PREPARING' ? 'Sent to Kitchen' :
-          qItem.status === 'READY' || qItem.status === 'SERVED' ? 'Served' : 'Preparing'
+        const orderStatus = mapKitchenStatus(qItem.status)
 
         qItem.items.forEach((dish, idx) => {
           mapped.push({
             id: qItem.id * 100 + idx,
             orderId: qItem.id,
             name: dish.name,
-            price: 12.50,
+            price: Number(dish.unitPrice ?? 0),
             quantity: dish.quantity,
             image: resolveMediaUrl(dish.image),
             status: orderStatus,
             customizations: dish.customizationNote || 'Standard Portions',
             customizedDetails: (dish.customizations || []).map((c: any) => ({
-              name: c.name || `Ingredient #${c.ingredientId}`,
+              name: c.ingredientName || c.name || `Ingredient #${c.ingredientId}`,
               originalAmount: c.originalAmount || 1,
               amount: c.amount || 1,
               unit: c.unit || 'pcs',
@@ -96,43 +126,15 @@ const loadOrders = async () => {
         })
       })
       orders.value = mapped
-      localStorage.setItem('gomeal_customer_orders', JSON.stringify(mapped))
       return
     }
   } catch (err) {
-    // Fallback to local storage if offline or server booting
-  }
-
-  const stored = localStorage.getItem('gomeal_customer_orders')
-  if (stored) {
-    try {
-      const parsed = JSON.parse(stored)
-      let changed = false
-      const mapped = parsed.map((item: any) => {
-        let servedAt = item.servedAt
-        if (item.status === 'Served' && !servedAt) {
-          servedAt = Date.now()
-          changed = true
-        }
-        return {
-          ...item,
-          tableNo: item.tableNo || '12B',
-          timePlaced: item.timePlaced || 'Just now',
-          servedAt
-        }
-      })
-      orders.value = mapped
-      if (changed) {
-        localStorage.setItem('gomeal_customer_orders', JSON.stringify(mapped))
-      }
-    } catch (e) {
-      console.error('Error loading orders:', e)
-    }
+    console.warn('Kitchen queue load notice:', err)
   }
 }
 
 const saveOrders = () => {
-  localStorage.setItem('gomeal_customer_orders', JSON.stringify(orders.value))
+  localStorage.setItem('gomeal_kitchen_tickets', JSON.stringify(orders.value))
 }
 
 // History Storage state
@@ -423,22 +425,29 @@ const handleStorageUpdate = () => {
 }
 
 onMounted(() => {
-  loadOrders()
-  loadHistory()
   window.addEventListener('storage', handleStorageUpdate)
-  
-  // Real-Time Socket.IO Kitchen Room synchronization
-  try {
-    const socket = getSocket()
-    socket.on('order.created', () => {
-      loadOrders()
-    })
-    socket.on('order.status.updated', () => {
-      loadOrders()
-    })
-  } catch (socketErr) {
-    console.warn('Socket listener setup notice:', socketErr)
+  window.addEventListener('keydown', onDishPreviewKeydown)
+
+  const onKitchenRealtime = () => {
+    loadOrders()
   }
+
+  ;(async () => {
+    try {
+      await ensureChefSession()
+      disconnectSocket()
+      const socket = getSocket()
+      socket.on('order.created', onKitchenRealtime)
+      socket.on('order.status.updated', onKitchenRealtime)
+      socket.on('order.ready', onKitchenRealtime)
+      socket.on('order.served', onKitchenRealtime)
+      await joinKitchenRoom()
+    } catch (socketErr) {
+      console.warn('Socket listener setup notice:', socketErr)
+    }
+    await loadOrders()
+    loadHistory()
+  })()
 
   // Auto-refresh interval in case reactive storage event is lost across pages
   const syncInterval = setInterval(() => {
@@ -491,6 +500,16 @@ onMounted(() => {
     clearInterval(syncInterval)
     clearInterval(timeTicker)
     window.removeEventListener('storage', handleStorageUpdate)
+    window.removeEventListener('keydown', onDishPreviewKeydown)
+    try {
+      const socket = getSocket()
+      socket.off('order.created')
+      socket.off('order.status.updated')
+      socket.off('order.ready')
+      socket.off('order.served')
+    } catch {
+      /* socket may already be down */
+    }
   })
 })
 
@@ -721,7 +740,18 @@ const handleManualOrder = () => {
                 <h4 class="font-black text-[15px] text-on-surface">{{ translateDishName(order.name) }}</h4>
                 <p class="text-[11px] text-outline font-bold mt-0.5">${{ order.price.toFixed(2) }} {{ currentLang === 'km' ? 'ក្នុងមួយមុខ' : 'each' }}</p>
               </div>
-              <img v-if="order.image" :src="order.image" class="w-12 h-12 object-cover rounded-lg border shrink-0" />
+              <button
+                v-if="order.image"
+                type="button"
+                class="relative w-12 h-12 shrink-0 rounded-lg border overflow-hidden cursor-zoom-in hover:ring-2 hover:ring-primary/50 focus:outline-none focus:ring-2 focus:ring-primary transition-all group/thumb"
+                :title="currentLang === 'km' ? 'ចុចដើម្បីមើលរូបធំ' : 'Click to view full image'"
+                @click="openDishPreview(order)"
+              >
+                <img :src="order.image" :alt="order.name" class="w-full h-full object-cover" />
+                <span class="absolute inset-0 bg-black/0 group-hover/thumb:bg-black/35 flex items-center justify-center transition-colors">
+                  <span class="material-symbols-outlined text-white text-[18px] opacity-0 group-hover/thumb:opacity-100 drop-shadow">zoom_in</span>
+                </span>
+              </button>
             </div>
 
             <!-- CUSTOM PORTION ALERTS section - highlight customers' extra ingredient requests! -->
@@ -928,6 +958,32 @@ const handleManualOrder = () => {
     >
       <span class="material-symbols-outlined text-primary-fixed-dim text-base">info</span>
       <span>{{ alertToastMessage }}</span>
+    </div>
+
+    <!-- Full dish photo preview -->
+    <div
+      v-if="dishPreview"
+      class="fixed inset-0 z-[200] flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm"
+      @click.self="closeDishPreview"
+    >
+      <div class="relative max-w-5xl w-full flex flex-col items-center gap-3" @click.stop>
+        <div class="relative max-w-full">
+          <button
+            type="button"
+            class="absolute top-2 right-2 p-2 rounded-full bg-white/95 text-on-surface shadow-lg hover:bg-primary hover:text-white transition-colors z-10"
+            :title="currentLang === 'km' ? 'បិទ' : 'Close'"
+            @click="closeDishPreview"
+          >
+            <span class="material-symbols-outlined text-xl">close</span>
+          </button>
+          <img
+            :src="dishPreview.src"
+            :alt="dishPreview.name"
+            class="max-w-full max-h-[80vh] w-auto h-auto object-contain rounded-2xl shadow-2xl bg-white"
+          />
+        </div>
+        <p class="text-white font-black text-sm sm:text-base drop-shadow">{{ translateDishName(dishPreview.name) }}</p>
+      </div>
     </div>
   </div>
 </template>
