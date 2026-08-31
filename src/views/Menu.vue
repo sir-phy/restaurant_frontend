@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
+import QRCode from 'qrcode'
 import { 
   t, 
   currentLang, 
@@ -11,10 +12,13 @@ import {
 } from '../i18n'
 import { menuService } from '../services/menu.js'
 import { orderService } from '../services/orders.js'
+import { paymentService, type KhqrCreateResult } from '../services/payments.js'
+import { invoiceService } from '../services/invoices.js'
 import { notificationService } from '../services/notifications.js'
 import { getSocket, joinTableRoom } from '../services/socket.js'
 import { login } from '../services/auth.js'
 import { getAccessToken } from '../services/api.js'
+import { API_BASE_URL } from '../services/config.js'
 
 const route = useRoute()
 
@@ -296,7 +300,10 @@ const loadOrders = () => {
   const stored = localStorage.getItem('gomeal_customer_orders')
   if (stored) {
     try {
-      allOrders.value = JSON.parse(stored)
+      allOrders.value = JSON.parse(stored).map((o: any) => ({
+        ...o,
+        price: Number(o.price)
+      }))
       return
     } catch (e) {
       console.error(e)
@@ -338,17 +345,41 @@ const activeDisplayOrders = computed(() => {
   return myOrders.value.filter((o: any) => o.status !== 'Served')
 })
 
+// ── Verified payment flow (backend-authoritative) ───────────────────────────
+// The frontend NEVER declares a payment successful. It creates a KHQR payment
+// on the backend, renders the backend's QR payload, polls the backend status
+// endpoint (which triggers Bakong verification) and only shows the receipt
+// once the backend reports PAID. States:
+//   creating → pending → success | failed | expired
 const isOrdersModalOpen = ref(false)
 const isPaymentQrModalOpen = ref(false)
 const billingAmount = ref(0)
 const qrType = ref<'dynamic' | 'static'>('dynamic')
+type PaymentStage = 'creating' | 'pending' | 'success' | 'failed' | 'expired'
+const paymentStage = ref<PaymentStage>('creating')
+const activePayment = ref<KhqrCreateResult | null>(null)
+const paymentError = ref('')
+const receiptLoading = ref(false)
+let paymentPollTimer: ReturnType<typeof setInterval> | null = null
+let isOpeningReceipt = false
+// Demo-only: shows the "ABA Sim" buttons when the backend runs with
+// BAKONG_SANDBOX=true. Hidden in production builds.
+const isSandboxUiEnabled = (import.meta as any).env?.VITE_BAKONG_SANDBOX === 'true'
 
-// ABA Pay Direct Launch & Sandbox Simulation States
+const paymentSessionKey = computed(() => `gomeal_active_payment_${currentTable.value}`)
+
+// ABA Pay Sandbox Simulator visual states (Mode 1 — sandbox builds only)
 const isAbaSimulatorOpen = ref(false)
 const isPayingSimulating = ref(false)
 const isPayingSucceed = ref(false)
 const sliderValue = ref(0)
 const paymentSimulatedTxId = ref('')
+
+// ── Post-payment verification receipt ───────────────────────────────────────
+// Built ONLY from backend data (invoice + payment status) once the payment is
+// verified PAID. Stays on screen until the customer explicitly closes it.
+const isReceiptModalOpen = ref(false)
+const paymentReceipt = ref<any>(null)
 
 const playSuccessChime = () => {
   try {
@@ -380,83 +411,298 @@ const playSuccessChime = () => {
 }
 
 const triggerAbaDeepLink = () => {
-  const khqr = qrType.value === 'dynamic' ? khqrData.value : staticKhqrData.value
+  // Deep-links the ACTIVE payload — the backend-generated KHQR when a payment
+  // is active (its MD5 is what verification is keyed on), the local static
+  // merchant QR otherwise.
+  const khqr = activeQrPayload.value
   const deepLinkUrl = `https://payment.bakong.org.kh/pay?code=${encodeURIComponent(khqr)}`
   try {
-    window.open(deepLinkUrl, '_blank')
+    const win = window.open(deepLinkUrl, '_blank')
+    if (!win) {
+      // window.open returns null (it does NOT throw) when the popup blocker
+      // stops it — e.g. the 4s auto-launch timer, which is not a user gesture.
+      // The visible "Deep Link ABA" button still works since it is a gesture.
+      console.warn('ABA deep link blocked by the popup blocker — use the "Deep Link ABA" button.')
+    }
   } catch (err) {
     console.warn('Redirect blocked by browser popup blocker. User can launch manually using the button.', err)
   }
 }
 
-const executeSimulationPayment = async () => {
-  if (isPayingSimulating.value || isPayingSucceed.value) return
-  isPayingSimulating.value = true
-  
-  const currentTableValue = currentTable.value || '02'
-  
-  // Call backend payment API
-  try {
-    await orderService.payTable(currentTableValue)
-  } catch (apiErr) {
-    console.log('Backend payment notice:', apiErr)
-  }
+// ── Verified payment lifecycle ───────────────────────────────────────────────
 
-  setTimeout(() => {
+const friendlyPaymentError = (message?: string): string => {
+  switch (message) {
+    case 'No pending billing request for this table':
+    case 'No unpaid orders are available for this table':
+      return currentLang.value === 'km'
+        ? 'មិនមានការបញ្ជាទិញដែលត្រូវបង់ប្រាក់សម្រាប់តុនេះទេ។'
+        : 'There are no unpaid orders left to settle for this table.'
+    case 'Order is not ready for billing':
+      return currentLang.value === 'km'
+        ? 'ការបញ្ជាទិញរបស់អ្នកមិនទាន់ត្រូវបានបម្រើនៅឡើយទេ។ សូមរង់ចាំមន្ត្រីបម្រើមុខម្ហូបសិន។'
+        : 'Your order has not been served yet. Please wait until the staff serves it.'
+    case 'Payment already completed':
+      return currentLang.value === 'km'
+        ? 'វិក្កយបត្រនេះត្រូវបានបង់ប្រាក់រួចរាល់ហើយ។'
+        : 'This bill has already been paid.'
+    default:
+      return currentLang.value === 'km'
+        ? 'មិនអាចទូទាត់ប្រាក់បានទេ។ សូមព្យាយាមម្តងទៀត។'
+        : (message || 'Unable to start the payment. Please try again.')
+  }
+}
+
+const stopPaymentPolling = () => {
+  if (paymentPollTimer) {
+    clearInterval(paymentPollTimer)
+    paymentPollTimer = null
+  }
+}
+
+const startPaymentPolling = () => {
+  stopPaymentPolling()
+  // Nudges a backend Bakong verification every ~4s (server rate limit: 60/min).
+  paymentPollTimer = setInterval(pollPaymentStatus, 4000)
+}
+
+const pollPaymentStatus = async () => {
+  // Stage guard: a stale tick after success/expiry must do nothing.
+  if (paymentStage.value !== 'pending' || !activePayment.value) return
+  const paymentId = activePayment.value.paymentId
+  try {
+    // Nudge the backend to verify against Bakong. Expected "not found yet"
+    // failures are ignored — the status call below is the source of truth.
+    paymentService.verifyPayment(paymentId).catch(() => {})
+
+    const res = await paymentService.getPaymentStatus(paymentId)
+    const status = res.data
+    if (!status) return
+    if (status.status === 'PAID') {
+      stopPaymentPolling()
+      await openVerifiedReceipt(status)
+    } else if (status.status === 'EXPIRED') {
+      stopPaymentPolling()
+      paymentStage.value = 'expired'
+    } else if (status.status === 'FAILED') {
+      stopPaymentPolling()
+      paymentStage.value = 'failed'
+    } else if (status.status === 'CANCELLED') {
+      stopPaymentPolling()
+      paymentStage.value = 'expired'
+    }
+  } catch (pollErr) {
+    // Transient network error — keep polling.
+    console.warn('Payment status poll retry:', pollErr)
+  }
+}
+
+/** Mirrors backend truth into the local cart: the table session is settled. */
+const clearTableOrders = () => {
+  allOrders.value = allOrders.value.filter((o: any) => o.tableNo !== currentTable.value)
+  localStorage.setItem('gomeal_customer_orders', JSON.stringify(allOrders.value))
+  window.dispatchEvent(new Event('storage'))
+}
+
+/**
+ * Builds the verified receipt ONLY from backend data (status + invoice) —
+ * called exclusively when the backend reports PAID. Idempotent: the receipt
+ * opens once even if several poll ticks land together.
+ */
+const openVerifiedReceipt = async (statusData: any) => {
+  if (isOpeningReceipt) return
+  isOpeningReceipt = true
+  receiptLoading.value = true
+  try {
+    let invoice: any = null
+    if (statusData.invoiceId) {
+      try {
+        const invRes = await invoiceService.getInvoice(statusData.invoiceId)
+        invoice = invRes.data
+      } catch (invErr) {
+        console.warn('Invoice fetch failed — receipt falls back to payment data:', invErr)
+      }
+    }
+    paymentReceipt.value = {
+      invoice,
+      transactionHash: statusData.transactionHash
+        || activePayment.value?.transactionNumber
+        || '',
+      paidAt: statusData.paidAt,
+      amount: statusData.amount ?? invoice?.totalAmount ?? 0,
+      currency: statusData.currency || invoice?.currency || 'USD',
+    }
+    paymentStage.value = 'success'
+    isPaymentQrModalOpen.value = false
+    isAbaSimulatorOpen.value = false
+    isReceiptModalOpen.value = true
+    sessionStorage.removeItem(paymentSessionKey.value)
+    clearTableOrders()
+    playSuccessChime()
+  } finally {
+    receiptLoading.value = false
+    isOpeningReceipt = false
+  }
+}
+
+const openVerifiedReceiptFromPaymentId = async (paymentId: number) => {
+  try {
+    const res = await paymentService.getPaymentStatus(paymentId)
+    if (res.data?.status === 'PAID') {
+      await openVerifiedReceipt(res.data)
+      return true
+    }
+  } catch (err) {
+    console.warn('Receipt recovery failed:', err)
+  }
+  return false
+}
+
+/**
+ * Get-or-create the table's KHQR payment. The backend computes the amount and
+ * returns the ORIGINAL pending payment on refresh/double-tap (idempotent) —
+ * the client never dictates amounts or status.
+ */
+const createTableKhqrPayment = async () => {
+  paymentError.value = ''
+  paymentStage.value = 'creating'
+  isAbaSimulatorOpen.value = false
+  isPayingSimulating.value = false
+  isPayingSucceed.value = false
+  try {
+    const res = await paymentService.generateTableKHQR(currentTable.value)
+    const data = res.data
+    if (!data) throw new Error('Empty payment response')
+    activePayment.value = data
+    paymentSimulatedTxId.value = data.transactionNumber
+    sessionStorage.setItem(paymentSessionKey.value, String(data.paymentId))
+    if (data.status === 'PAID') {
+      // Paid from another tab while we were away — straight to the receipt.
+      await openVerifiedReceiptFromPaymentId(data.paymentId)
+      return
+    }
+    paymentStage.value = 'pending'
+    startPaymentPolling()
+  } catch (err: any) {
+    paymentStage.value = 'failed'
+    paymentError.value = friendlyPaymentError(err?.message)
+  }
+}
+
+/**
+ * Entry point of the Scan & Pay modal: resumes an in-flight payment for this
+ * table when one exists (page refresh / reopened tab), otherwise creates one.
+ */
+const startVerifiedPayment = async () => {
+  const storedId = sessionStorage.getItem(paymentSessionKey.value)
+  if (storedId) {
+    try {
+      const res = await paymentService.getPaymentStatus(storedId)
+      const status = res.data
+      if (status?.status === 'PAID') {
+        await openVerifiedReceipt(status)
+        return
+      }
+      if (status?.status !== 'PENDING' && status?.status !== 'PROCESSING') {
+        // EXPIRED / FAILED / CANCELLED — the QR is dead; start fresh.
+        sessionStorage.removeItem(paymentSessionKey.value)
+      }
+    } catch {
+      sessionStorage.removeItem(paymentSessionKey.value)
+    }
+  }
+  await createTableKhqrPayment()
+}
+
+/** "Try Again" after a FAILED verification — resume polling. */
+const retryFailedPayment = () => {
+  if (!activePayment.value) {
+    createTableKhqrPayment()
+    return
+  }
+  paymentStage.value = 'pending'
+  startPaymentPolling()
+  pollPaymentStatus()
+}
+
+/** "Generate New QR" after EXPIRED — discards the dead payment reference. */
+const generateNewQr = async () => {
+  sessionStorage.removeItem(paymentSessionKey.value)
+  activePayment.value = null
+  await createTableKhqrPayment()
+}
+
+/** Close the Scan & Pay modal: stop polling but keep any pending payment so a
+ *  reopen resumes it (idempotent create) instead of duplicating it. */
+const closePaymentModal = () => {
+  stopPaymentPolling()
+  isPaymentQrModalOpen.value = false
+  isAbaSimulatorOpen.value = false
+}
+
+/**
+ * SANDBOX ONLY (visible when the backend runs with BAKONG_SANDBOX=true): asks
+ * the BACKEND to settle this payment through the real settlement + invoice
+ * path. The receipt still appears only after the status poll reports PAID.
+ */
+const confirmSandboxSettle = async () => {
+  if (isPayingSimulating.value || isPayingSucceed.value || !activePayment.value) return
+  isPayingSimulating.value = true
+  try {
+    await paymentService.sandboxSettlePayment(activePayment.value.paymentId)
     isPayingSimulating.value = false
     isPayingSucceed.value = true
     playSuccessChime()
-    
-    // Settle the bill directly in state
-    const tableOrders = allOrders.value.filter((o: any) => o.tableNo === currentTableValue)
-    
-    // Create new transaction receipt inside gomeal_payout_history
-    const rawHistory = localStorage.getItem('gomeal_payout_history')
-    let history: any[] = []
-    if (rawHistory) {
-      try {
-        history = JSON.parse(rawHistory)
-      } catch (err) {
-        console.error(err)
-      }
+    // The running poll flips the UI to the verified receipt automatically.
+    if (!paymentPollTimer) {
+      paymentStage.value = 'pending'
+      startPaymentPolling()
     }
-    
-    paymentSimulatedTxId.value = `TXN-${Math.floor(10000 + Math.random() * 90000)}`
-    
-    const newTx = {
-      id: paymentSimulatedTxId.value,
-      timestamp: Date.now(),
-      tableNo: currentTableValue,
-      customerName: tableOrders[0]?.customerName || `Guest Table #${currentTableValue}`,
-      items: tableOrders.map((i: any) => ({
-        name: i.name,
-        price: i.price,
-        quantity: i.quantity
-      })),
-      subtotal: orderSubtotal.value,
-      tax: orderTax.value,
-      serviceFee: orderServiceFee.value,
-      total: orderTotal.value,
-      paymentMethod: 'Mobile Pay'
-    }
-    
-    history.unshift(newTx)
-    localStorage.setItem('gomeal_payout_history', JSON.stringify(history))
-    
-    // Clear those active settled orders from customer orders database
-    allOrders.value = allOrders.value.filter((o: any) => o.tableNo !== currentTableValue)
-    localStorage.setItem('gomeal_customer_orders', JSON.stringify(allOrders.value))
-    
-    // Force browser storage update notification
-    window.dispatchEvent(new Event('storage'))
-
-    // Automatically hide this card/modal 2 seconds after success
-    setTimeout(() => {
-      isPaymentQrModalOpen.value = false
-      resetSimulationState()
-    }, 2000)
-  }, 1800)
+  } catch (err: any) {
+    isPayingSimulating.value = false
+    isPayingSucceed.value = false
+    stopPaymentPolling()
+    paymentStage.value = 'failed'
+    paymentError.value = friendlyPaymentError(err?.message)
+  }
 }
+
+/** "Done" on the receipt: reset the payment state and return to the menu. */
+const finishReceipt = () => {
+  isReceiptModalOpen.value = false
+  stopPaymentPolling()
+  activePayment.value = null
+  paymentReceipt.value = null
+  paymentStage.value = 'creating'
+  sessionStorage.removeItem(paymentSessionKey.value)
+  orderSuccessMessage.value = currentLang.value === 'km'
+    ? `ការទូទាត់ប្រាក់ត្រូវបានបញ្ជាក់រួចរាល់។ អរគុណសម្រាប់ការពិសាអាហារនៅតុ #${currentTable.value}!`
+    : `Payment verified — thank you for dining at Table #${currentTable.value}!`
+  isOrderSuccessToastVisible.value = true
+  setTimeout(() => {
+    isOrderSuccessToastVisible.value = false
+  }, 6000)
+}
+
+/** "View Receipt": opens the backend-generated PDF invoice in a new tab. */
+const viewReceiptPdf = async () => {
+  const invoiceId = paymentReceipt.value?.invoice?.id
+  if (!invoiceId) return
+  try {
+    const res = await fetch(`${API_BASE_URL}/api/invoices/${invoiceId}/pdf`, {
+      headers: { Authorization: `Bearer ${getAccessToken() || ''}` }
+    })
+    if (!res.ok) throw new Error(`PDF unavailable (${res.status})`)
+    const blob = await res.blob()
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank')
+    setTimeout(() => URL.revokeObjectURL(url), 60000)
+  } catch (err) {
+    console.warn('Failed to open the receipt PDF:', err)
+  }
+}
+
+
 
 const resetSimulationState = () => {
   isAbaSimulatorOpen.value = false
@@ -468,7 +714,7 @@ const resetSimulationState = () => {
 
 const payWithSimulatorDirectly = () => {
   isAbaSimulatorOpen.value = true
-  executeSimulationPayment()
+  confirmSandboxSettle()
 }
 
 // Helper to format tags for EMVCo/KHQR standard compliance
@@ -494,69 +740,80 @@ const calculateCrc16 = (data: string): string => {
   return crc.toString(16).toUpperCase().padStart(4, '0')
 }
 
-// Dynamic Bill KHQR: Prefills exact amount and table details
-const khqrData = computed(() => {
-  const amountStr = billingAmount.value.toFixed(2)
-  const tableStr = currentTable.value || '02'
-  
-  const t00 = '000201' // Payload Format Indicator
-  const t01 = '010212' // Dynamic Point-of-Initiation
-  
-  // Tag 38 (Merchant Account Info - Bakong Template)
-  // Sub 00 (Account/UUID): 0112185250100438, Sub 01: gomeal01, Sub 02: PHNOMPENH
-  const sub00 = getEmvTag('00', '0112185250100438')
-  const sub01 = getEmvTag('01', 'gomeal01')
-  const sub02 = getEmvTag('02', 'PHNOMPENH')
-  const t38 = getEmvTag('38', sub00 + sub01 + sub02)
-  
-  const t52 = '52045811' // Restaurant MCC
-  const t53 = '5303840'  // USD Currency
-  const t54 = getEmvTag('54', amountStr) // Amount
-  const t58 = '5802KH'   // Country
-  const t59 = getEmvTag('59', 'Gomeal Restaurant')
-  const t60 = getEmvTag('60', 'Phnom Penh')
-  
-  const sub07 = getEmvTag('07', `Table #${tableStr}`)
-  const t62 = getEmvTag('62', sub07)
-  
-  const partial = t00 + t01 + t38 + t52 + t53 + t54 + t58 + t59 + t60 + t62 + '6304'
-  return partial + calculateCrc16(partial)
-})
+// ── Bakong / KHQR merchant configuration ────────────────────────────────────
+// Mirrors restaurant_backend/.env. These values are embedded in the QR
+// payload (payee details), so they are public. The backend does the same via
+// the official `bakong-khqr` SDK; this mirrors that so the QR the ABA/Bakong
+// app scans is accepted instead of "invalid".
+const khqrConfig = {
+  accountId: (import.meta.env.VITE_BAKONG_ACCOUNT_ID || 'sophy_moeurn@bkrt') as string,
+  accountName: (import.meta.env.VITE_BAKONG_ACCOUNT_NAME || '') as string,
+  merchantName: (import.meta.env.VITE_BAKONG_MERCHANT_NAME || 'My Restaurant') as string,
+  merchantCity: (import.meta.env.VITE_BAKONG_MERCHANT_CITY || 'Phnom Penh') as string,
+  merchantId: (import.meta.env.VITE_BAKONG_MERCHANT_ID || 'RESTAURANT') as string,
+  // Acquiring bank is normally derived from the part after "@" in the account
+  // id, matching restaurant_backend/src/config/bakong.ts.
+  acquiringBank:
+    import.meta.env.VITE_BAKONG_ACQUIRING_BANK ||
+    ((import.meta.env.VITE_BAKONG_ACCOUNT_ID || 'sophy_moeurn@bkrt').split('@')[1]?.toUpperCase() || 'BKRT'),
+  // The official bakong-khqr SDK hardcodes MCC 5999 (it ignores any configured
+  // value), so backend-generated QRs always carry 5999. Use the same here so
+  // the customer QR is byte-identical to the backend's.
+  mcc: (import.meta.env.VITE_BAKONG_MCC || '5999') as string,
+  currency: ((import.meta.env.VITE_BAKONG_CURRENCY || 'USD').toUpperCase() as string),
+  country: ((import.meta.env.VITE_BAKONG_COUNTRY || 'KH').toUpperCase() as string),
+}
+const KHQR_CURRENCY_CODE = khqrConfig.currency === 'KHR' ? '116' : '840'
 
-// Static Merchant KHQR: Keeps it the raw/original QR code pattern
-const staticKhqrData = computed(() => {
-  const tableStr = currentTable.value || '02'
-  
+// Builds a standards-compliant Bakong merchant KHQR with the same layout as the
+// official bakong-khqr SDK (tag 30 merchant account info with sub 00 = Bakong
+// account, sub 01 = merchant id, sub 02 = acquiring bank; timestamp tag 99;
+// CRC-16/CCITT tag 63). Hand-rolled QRs that use tag 38 with bogus values are
+// rejected by the ABA app.
+const buildKhqr = (amount: number | null, billNumber: string, terminalLabel: string): string => {
   const t00 = '000201' // Payload Format Indicator
-  const t01 = '010211' // Static Point-of-Initiation
-  
-  const sub00 = getEmvTag('00', '0112185250100438')
-  const sub01 = getEmvTag('01', 'gomeal01')
-  const sub02 = getEmvTag('02', 'PHNOMPENH')
-  const t38 = getEmvTag('38', sub00 + sub01 + sub02)
-  
-  const t52 = '52045811' // Restaurant MCC
-  const t53 = '5303840'  // USD Currency
-  const t58 = '5802KH'   // Country
-  const t59 = getEmvTag('59', 'Gomeal Restaurant')
-  const t60 = getEmvTag('60', 'Phnom Penh')
-  
-  // For static QR, let's keep details clean and steady, matching the uploaded real QR structure
-  const sub07 = getEmvTag('07', `Table #${tableStr}`)
-  const t62 = getEmvTag('62', sub07)
-  
-  const partial = t00 + t01 + t38 + t52 + t53 + t58 + t59 + t60 + t62 + '6304'
-  return partial + calculateCrc16(partial)
-})
+  const t01 = amount != null && amount > 0 ? '010212' : '010211' // Dynamic / Static
 
-const getQrUrl = (data: string) => {
-  return `https://api.qrserver.com/v1/create-qr-code/?size=250x250&color=0f172a&data=${encodeURIComponent(data)}`
+  // Tag 30: Merchant Account Information (Bakong template).
+  // sub 00 = Bakong account id, sub 01 = merchant id, sub 02 = acquiring bank.
+  const sub00 = getEmvTag('00', khqrConfig.accountId)
+  const sub01 = getEmvTag('01', khqrConfig.merchantId)
+  const sub02 = getEmvTag('02', khqrConfig.acquiringBank)
+  const t30 = getEmvTag('30', sub00 + sub01 + sub02)
+
+  const t52 = getEmvTag('52', khqrConfig.mcc) // Merchant Category Code
+  const t53 = getEmvTag('53', KHQR_CURRENCY_CODE) // Transaction Currency
+  // EMV tags MUST appear in strict ascending order: the amount (54) goes right
+  // after the currency (53) and before the country (58) — exactly like the
+  // official bakong-khqr SDK. Out-of-order tags make the ABA app reject the QR.
+  const t54 = amount != null && amount > 0 ? getEmvTag('54', amount.toFixed(2)) : ''
+  const t58 = getEmvTag('58', khqrConfig.country) // Country
+  const t59 = getEmvTag('59', khqrConfig.merchantName.slice(0, 24)) // Merchant Name
+  const t60 = getEmvTag('60', khqrConfig.merchantCity.slice(0, 15)) // Merchant City
+
+  // Full payload in ascending tag order: 00,01,30,52,53,54,58,59,60,62,99
+  let body = t00 + t01 + t30 + t52 + t53 + t54 + t58 + t59 + t60
+
+  // Tag 62: Additional Data — bill number (01) + terminal/table label (07).
+  const t62 = getEmvTag('62', getEmvTag('01', billNumber) + getEmvTag('07', terminalLabel))
+  body += t62
+
+  // Tag 99: millisecond timestamp, wrapped as a nested TLV (00<len>epoch)
+  // exactly like the bakong-khqr SDK's TimeStamp tag so the payload structure
+  // matches the official generator byte-for-byte.
+  const ts = String(Math.floor(Date.now()))
+  const tsNested = `00${ts.length.toString().padStart(2, '0')}${ts}`
+  body += getEmvTag('99', tsNested)
+
+  // Tag 63: CRC-16/CCITT (computed over everything including the "6304" prefix).
+  const crcInput = body + '6304'
+  return crcInput + calculateCrc16(crcInput)
 }
 
-const cartCount = computed(() => {
-  return activeDisplayOrders.value.reduce((acc: number, item: any) => acc + item.quantity, 0)
-})
-
+// ── Bill totals ──────────────────────────────────────────────────────────────
+// Declared BEFORE the QR computeds and the immediate QR watcher below: that
+// watcher evaluates khqrData during setup, so this whole dependency chain
+// must already be initialized (otherwise: TDZ ReferenceError → white screen).
 const orderSubtotal = computed(() => {
   return myOrders.value.reduce((acc: number, item: any) => acc + (item.price * item.quantity), 0)
 })
@@ -571,6 +828,94 @@ const orderServiceFee = computed(() => {
 
 const orderTotal = computed(() => {
   return +(orderSubtotal.value + orderTax.value + orderServiceFee.value).toFixed(2)
+})
+
+// ── Payable bill amount (single source of truth) ─────────────────────────────
+// Prefers the amount captured when the bill was requested and falls back to
+// the live order total, so the on-screen amount and the QR payload can never
+// disagree. A KHQR dynamic bill must embed an amount > 0 (tag 54); a $0.00
+// total would silently degrade the dynamic QR into an amount-less static one,
+// which is exactly why bank apps showed no pre-filled bill amount.
+const effectiveBillAmount = computed(() => {
+  const requested = Number(billingAmount.value)
+  const live = Number(orderTotal.value)
+  const amt =
+    Number.isFinite(requested) && requested > 0
+      ? requested
+      : Number.isFinite(live) && live > 0
+        ? live
+        : 0
+  return Math.round(amt * 100) / 100
+})
+
+// Amount shown on the Scan & Pay screen. Once a backend payment exists it is
+// the SINGLE source of truth — the backend computed it from the database and
+// verification compares against exactly this number.
+const payableAmount = computed(() =>
+  activePayment.value?.amount != null
+    ? Number(activePayment.value.amount)
+    : effectiveBillAmount.value,
+)
+
+// Dynamic Bill KHQR: prefills the exact amount and bill/table details. The
+// amount comes from effectiveBillAmount so the payload and the on-screen
+// total can never disagree; a $0.00 bill degrades to an amount-less payload,
+// which the UI explains instead of showing a misleading QR.
+const khqrData = computed(() => {
+  const amount = effectiveBillAmount.value > 0 ? effectiveBillAmount.value : null
+  return buildKhqr(
+    amount,
+    `PAY-${currentTable.value || '02'}`,
+    `Table #${currentTable.value || '02'}`,
+  )
+})
+
+// Static Merchant KHQR: no amount (customer enters amount on the app side).
+const staticKhqrData = computed(() => {
+  return buildKhqr(null, `PAY-${currentTable.value || '02'}`, `Table #${currentTable.value || '02'}`)
+})
+
+// ── QR rendering (LOCAL vector renderer — presentation only) ────────────────
+// The encoded payload is NEVER modified: it is rendered verbatim by the same
+// `qrcode` library used for the table PDFs. SVG output keeps every module
+// pixel-sharp at any screen size (no raster rescaling, no fractional pixels),
+// uses pure BLACK modules on a pure WHITE background, and bakes in a
+// 6-module quiet zone on all sides — above the KHQR/EMVCo minimum of 4 — so
+// the white border is always clearly visible and never reads as part of the
+// code. Error correction stays at level M as mandated by KHQR.
+const QR_RENDERER_OPTIONS = {
+  type: 'svg' as const,
+  errorCorrectionLevel: 'M' as const,
+  margin: 6,
+  color: { dark: '#000000', light: '#FFFFFF' },
+}
+
+const qrImageUrl = ref('')
+// The dynamic tab MUST render the backend-generated KHQR payload — its MD5 is
+// what Bakong verification is keyed on; a locally rebuilt payload would never
+// verify. The static tab stays the informational merchant QR.
+const activeQrPayload = computed(() => {
+  if (qrType.value === 'dynamic' && activePayment.value?.qrPayload) {
+    return activePayment.value.qrPayload
+  }
+  return qrType.value === 'dynamic' ? khqrData.value : staticKhqrData.value
+})
+
+watch(
+  activeQrPayload,
+  async (payload) => {
+    try {
+      const svg = await QRCode.toString(payload, QR_RENDERER_OPTIONS)
+      qrImageUrl.value = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`
+    } catch (err) {
+      console.error('Failed to render payment QR:', err)
+    }
+  },
+  { immediate: true },
+)
+
+const cartCount = computed(() => {
+  return activeDisplayOrders.value.reduce((acc: number, item: any) => acc + item.quantity, 0)
 })
 
 const updateOrdersStorage = () => {
@@ -617,19 +962,19 @@ const requestBill = () => {
     }, 4000)
     return
   }
-  // Initialize values
+  // Initialize display values
   billingAmount.value = orderTotal.value
+  qrType.value = 'dynamic'
   isPaymentQrModalOpen.value = true
-  resetSimulationState()
 
-  // Automatically attempt opening ABA App scan screen using deep link standard code
-  setTimeout(() => {
-    triggerAbaDeepLink()
-  }, 4000)
+  // Start the VERIFIED payment flow: resumes an in-flight payment for this
+  // table (page refresh / reopened tab) or creates one on the backend, then
+  // polls until the backend confirms PAID / FAILED / EXPIRED.
+  startVerifiedPayment()
 }
 
 const confirmPaymentRequest = () => {
-  const totalAmount = billingAmount.value
+  const totalAmount = effectiveBillAmount.value
   
   // Set all current table orders to Pending payment
   allOrders.value = allOrders.value.map((o: any) => {
@@ -716,7 +1061,7 @@ const checkoutProductDirectly = async (item: any, withCustomization: boolean = f
     allOrders.value.push({
       id: Date.now() + Math.floor(Math.random() * 1000),
       name: item.name,
-      price: item.price,
+      price: Number(item.price),
       quantity: qty,
       image: item.image || 'https://images.unsplash.com/photo-1546069901-ba9599a7e63c?auto=format&fit=crop&q=80&w=400',
       status: 'Preparing',
@@ -905,7 +1250,7 @@ const refreshMenuFromBackend = async () => {
         return {
           id: i.id,
           name: i.name,
-          price: i.price,
+          price: Number(i.price),
           description: i.description || '',
           ingredients: (i.ingredients || []).map((ing: any) => ({
             name: ing.name,
@@ -971,6 +1316,7 @@ onMounted(async () => {
   }, 2500)
   onUnmounted(() => {
     clearInterval(interval)
+    stopPaymentPolling()
     window.removeEventListener('storage', syncMenuData)
   })
 })
@@ -1609,14 +1955,7 @@ onMounted(async () => {
                   </span>
                 </div>
 
-                <button 
-                  @click="removeOrder(order.id)"
-                  class="w-8 h-8 flex items-center justify-center text-outline hover:text-error hover:bg-error/10 rounded-lg transition-colors"
-                  title="Cancel item"
-                >
-                  <span class="material-symbols-outlined text-lg">delete</span>
-                </button>
-              </div>
+                              </div>
             </div>
           </div>
           <div v-else-if="myOrders.length > 0" class="text-center py-12 bg-emerald-50/50 rounded-[28px] border border-dashed border-emerald-200/60 p-6 flex flex-col items-center justify-center">
@@ -1765,7 +2104,7 @@ onMounted(async () => {
               </div>
               <div class="flex justify-between text-base border-t border-white/5 pt-2 font-display">
                 <span class="text-white font-black">{{ currentLang === 'km' ? 'ទឹកប្រាក់សរុប' : 'Amount Settled' }}</span>
-                <span class="text-[#1ebbc4] font-black">${{ billingAmount.toFixed(2) }}</span>
+                <span class="text-[#1ebbc4] font-black">${{ payableAmount.toFixed(2) }}</span>
               </div>
             </div>
 
@@ -1791,7 +2130,7 @@ onMounted(async () => {
               <div class="border-t border-white/5 pt-3 space-y-2">
                 <div class="flex justify-between">
                   <span class="text-slate-400 font-medium font-sans">Account ID</span>
-                  <span class="text-white font-extrabold font-mono text-[11px]">011 218 525 010 0438</span>
+                  <span class="text-white font-extrabold font-mono text-[11px]">{{ khqrConfig.accountId }}</span>
                 </div>
                 <div class="flex justify-between">
                   <span class="text-slate-400 font-medium font-sans">Source Desk</span>
@@ -1799,7 +2138,7 @@ onMounted(async () => {
                 </div>
                 <div class="flex justify-between text-base border-t border-white/5 pt-2.5">
                   <span class="text-white font-black">{{ currentLang === 'km' ? 'ទឹកប្រាក់ត្រូវបង់' : 'Total Amount' }}</span>
-                  <span class="text-[#1ebbc4] font-black">${{ billingAmount.toFixed(2) }}</span>
+                  <span class="text-[#1ebbc4] font-black">${{ payableAmount.toFixed(2) }}</span>
                 </div>
               </div>
             </div>
@@ -1813,10 +2152,12 @@ onMounted(async () => {
                 </span>
               </div>
 
-              <!-- High fidelity CTA Action Button -->
+              <!-- High fidelity CTA Action Button — asks the BACKEND sandbox to
+                   settle; the verified receipt still arrives via status polling. -->
               <button
-                @click="executeSimulationPayment"
-                class="w-full bg-teal-400 hover:bg-teal-300 text-slate-950 py-3.5 rounded-2xl font-black text-xs uppercase tracking-wider shadow-lg shadow-teal-400/20 active:scale-98 hover:scale-[1.01] transition-all flex items-center justify-center gap-2 cursor-pointer outline-none border-none"
+                @click="confirmSandboxSettle"
+                :disabled="isPayingSimulating || isPayingSucceed"
+                class="w-full bg-teal-400 hover:bg-teal-300 text-slate-950 py-3.5 rounded-2xl font-black text-xs uppercase tracking-wider shadow-lg shadow-teal-400/20 active:scale-98 hover:scale-[1.01] transition-all flex items-center justify-center gap-2 cursor-pointer outline-none border-none disabled:opacity-60 disabled:cursor-not-allowed"
               >
                 <span class="material-symbols-outlined text-sm font-black">mobile_friendly</span>
                 {{ currentLang === 'km' ? 'យល់ព្រម និងទូទាត់លុយ' : 'Approve & Settle Via ABA' }}
@@ -1847,7 +2188,7 @@ onMounted(async () => {
           <h3 class="text-base sm:text-lg font-black text-on-surface">{{ currentLang === 'km' ? 'ស្កេន និងទូទាត់ប្រាក់ (បាគង / KHQR)' : 'Scan & Pay (Bakong / KHQR)' }}</h3>
           <p class="text-[10px] sm:text-[11px] text-on-surface-variant/80 font-bold uppercase tracking-wider mt-0.5">{{ currentLang === 'km' ? 'ការទូទាត់ឌីជីថល តុលេខ #' + currentTable : 'Table #' + currentTable + ' Digital Settlement' }}</p>
           <button 
-            @click="isPaymentQrModalOpen = false"
+            @click="closePaymentModal"
             class="absolute top-3 right-3 p-1.5 bg-white rounded-full hover:bg-surface-container text-outline hover:text-on-surface transition-all shadow-sm outline-none border-none cursor-pointer"
           >
             <span class="material-symbols-outlined text-base">close</span>
@@ -1861,7 +2202,7 @@ onMounted(async () => {
           <div class="text-center mb-3 sm:mb-4 w-full bg-white py-3.5 px-4 rounded-2xl border border-outline-variant/30 shadow-xs">
             <span class="text-[9px] sm:text-[10px] font-black text-outline uppercase tracking-widest block">{{ currentLang === 'km' ? 'ទឹកប្រាក់ត្រូវទូទាត់ជាក់ស្តែង' : 'Exact Payment Amount' }}</span>
             <span class="text-2xl sm:text-3xl font-black text-slate-900 mt-0.5 block">
-              ${{ billingAmount.toFixed(2) }}
+              ${{ payableAmount.toFixed(2) }}
             </span>
             <div class="mt-1.5 flex items-center justify-center gap-1 text-[10px] sm:text-xs text-primary font-bold">
               <span class="material-symbols-outlined text-xs sm:text-sm">info</span>
@@ -1891,7 +2232,10 @@ onMounted(async () => {
                 {{ currentLang === 'km' ? 'បើក ABA ផ្ទាល់' : 'Deep Link ABA' }}
               </button>
               
+              <!-- Sandbox only: the sim asks the BACKEND to settle this payment;
+                   hidden entirely in non-sandbox environments. -->
               <button
+                v-if="isSandboxUiEnabled"
                 @click="isAbaSimulatorOpen = true"
                 type="button"
                 class="bg-amber-600 hover:bg-amber-700 text-white py-2.5 px-3 rounded-xl text-center font-black text-[10px] tracking-wide flex items-center justify-center gap-1 border-none shadow-sm active:scale-95 transition-all outline-none cursor-pointer"
@@ -1928,49 +2272,109 @@ onMounted(async () => {
             </button>
           </div>
 
-          <!-- QR Code Container -->
-          <div class="relative bg-white p-4 rounded-3xl shadow-md border border-outline-variant/40 flex items-center justify-center w-[180px] h-[180px] sm:w-[200px] sm:h-[200px] shrink-0">
-            <img 
-              :src="qrType === 'dynamic' ? getQrUrl(khqrData) : getQrUrl(staticKhqrData)" 
-              alt="Payment QR" 
-              class="w-full h-full object-contain rounded-2xl"
-              referrerPolicy="no-referrer"
-            />
-            
-            <!-- Beautiful Central Logo Overlay matching Cambodian Banking Apps -->
-            <div class="absolute inset-0 flex items-center justify-center pointer-events-none">
-              <div class="w-9 h-9 bg-white rounded-full flex items-center justify-center shadow-md border-2 border-white scale-105">
-                <div class="w-7 h-7 bg-red-600 rounded-full flex items-center justify-center">
-                  <span class="text-white text-[10px] font-extrabold tracking-tighter shrink-0 select-none font-sans">KH</span>
-                </div>
+          <!-- QR Code: clean white card, vector-sharp modules, 6-module quiet
+               zone baked into the image PLUS padding wider than the card's
+               corner radius, so the rounded corners can never clip the code's
+               white border. The payload is the BACKEND-generated KHQR —
+               presentation only, never modified. -->
+          <div class="shrink-0 flex flex-col items-center gap-3">
+            <div class="relative bg-white rounded-2xl shadow-md border border-outline-variant/40 p-5 sm:p-6 w-60 h-60 sm:w-80 sm:h-80 flex items-center justify-center overflow-hidden">
+              <!-- Creating: get-or-create the payment on the backend -->
+              <div
+                v-if="paymentStage === 'creating'"
+                class="w-full h-full flex flex-col items-center justify-center text-center gap-3 px-2"
+              >
+                <span class="material-symbols-outlined text-primary text-4xl animate-spin">progress_activity</span>
+                <p class="text-[11px] font-black text-slate-600 uppercase tracking-wider">
+                  {{ currentLang === 'km' ? 'កំពុងរៀបចំកូដទូទាត់...' : 'Preparing your payment QR...' }}
+                </p>
               </div>
+              <!-- $0.00 guard (only before a backend payment exists): a dynamic
+                   bill must embed an amount > 0, so explain instead of rendering
+                   a QR that silently has no bill amount. -->
+              <div
+                v-else-if="qrType === 'dynamic' && !activePayment && payableAmount <= 0"
+                class="w-full h-full flex flex-col items-center justify-center text-center gap-2 px-2"
+              >
+                <span class="material-symbols-outlined text-amber-600 text-3xl">receipt_long</span>
+                <p class="text-[11px] font-bold text-slate-600 leading-relaxed">
+                  {{ currentLang === 'km'
+                    ? 'វិក្កយបត្រនេះមានតម្លៃ $0.00។ បន្ថែមមុខម្ហូប ឬប្រើ QR កូដទូទៅ។'
+                    : 'This bill totals $0.00. Add items to your order, or pay with the Static QR.' }}
+                </p>
+              </div>
+              <img
+                v-else-if="qrImageUrl"
+                :src="qrImageUrl"
+                alt="Payment QR"
+                class="w-full h-full block"
+                referrerPolicy="no-referrer"
+              />
             </div>
-          </div>
 
-          <!-- SCAN TROUBLESHOOTING & INSTANT AUTO PAY -->
-          <div class="w-full bg-amber-50/70 border border-amber-200 rounded-2xl p-3.5 mt-4 text-left shadow-2xs shrink-0 flex flex-col gap-2.5">
-            <div class="flex items-start gap-2">
-              <span class="material-symbols-outlined text-amber-600 font-extrabold text-lg mt-0.5 shrink-0 animate-pulse">warning</span>
-              <div class="min-w-0 flex-1">
-                <h4 class="text-[11px] font-black text-amber-950 uppercase tracking-wider leading-none">{{ currentLang === 'km' ? 'បញ្ហាស្កេនមែនទេ?' : 'Having Scanning Issues?' }}</h4>
-                <p class="text-[10px] text-amber-900 font-semibold mt-1 leading-relaxed">
-                  {{ currentLang === 'km' ? 'ប្រសិនបើការស្កេនជាមួយកម្មវិធី ABA របស់អ្នកបង្ហាញថា "Invalid Qr Merchant Data" គឺមកពីនេះជាគណនីគំរូសាកល្បងរបស់ប្រព័ន្ធ។' : 'If scanning with your real phone bank app displays "Invalid Qr Merchant Data", it is because this account is a mock sandbox demonstrator.' }}
+            <!-- Scan-to-pay caption (outside the quiet zone) -->
+            <div class="flex items-center gap-1.5 text-slate-600">
+              <span class="material-symbols-outlined text-base text-primary">qr_code_scanner</span>
+              <span class="text-[11px] sm:text-xs font-black uppercase tracking-widest">
+                {{ currentLang === 'km' ? 'ស្កេនដើម្បីបង់ប្រាក់' : 'Scan to Pay' }}
+              </span>
+            </div>
+
+            <!-- Waiting for payment confirmation (polls the backend; the
+                 backend verifies with Bakong — the client never self-declares) -->
+            <div
+              v-if="paymentStage === 'pending'"
+              class="w-full bg-emerald-50 border border-emerald-200 rounded-2xl px-4 py-3 flex items-center gap-3"
+            >
+              <span class="material-symbols-outlined text-emerald-600 text-xl animate-spin shrink-0">progress_activity</span>
+              <div class="min-w-0 flex-1 text-left">
+                <p class="text-[11px] font-black text-emerald-800 leading-tight">
+                  {{ currentLang === 'km' ? 'កំពុងរង់ចាំការបញ្ជាក់ការទូទាត់ប្រាក់...' : 'Waiting for Payment Confirmation...' }}
+                </p>
+                <p class="text-[10px] text-emerald-700/80 font-bold mt-0.5 leading-snug">
+                  {{ currentLang === 'km' ? 'បន្ទាប់ពីអ្នកបង់ប្រាក់តាមរយៈកម្មវិធីធនាគារ វិក្កយបត្រនឹងបង្ហាញដោយស្វ័យប្រវត្តិ។' : 'After you pay in your banking app, your verified receipt appears here automatically.' }}
                 </p>
               </div>
             </div>
-            
-            <!-- Action to auto-pay -->
-            <button
-              @click="payWithSimulatorDirectly"
-              type="button"
-              class="w-full bg-amber-600 hover:bg-amber-700 text-white rounded-xl py-2.5 px-3 font-black text-[10px] uppercase tracking-wider flex items-center justify-center gap-1.5 shadow-xs border-none cursor-pointer outline-none active:scale-95 transition-all animate-pulse"
+
+                        <!-- PAYMENT EXPIRED panel — Generate New QR / Cancel -->
+            <div
+              v-else-if="paymentStage === 'expired'"
+              class="w-full bg-amber-50 border border-amber-200 rounded-2xl px-4 py-3.5 flex flex-col gap-3"
             >
-              <span class="material-symbols-outlined text-sm">payments</span>
-              <span>{{ currentLang === 'km' ? 'ចុចទីនេះដើម្បីបំពេញការទូទាត់គំរូ និងសម្អាតតុ' : 'Simulate Success & Clear Table Instantly' }}</span>
-            </button>
+              <div class="flex items-start gap-2">
+                <span class="material-symbols-outlined text-amber-600 font-extrabold text-xl shrink-0">schedule</span>
+                <div class="min-w-0 flex-1">
+                  <p class="text-[12px] font-black text-amber-800 uppercase tracking-wider leading-none">
+                    {{ currentLang === 'km' ? 'កូដទូទាត់ផុតកំណត់' : 'Payment Expired' }}
+                  </p>
+                  <p class="text-[10px] text-amber-700/90 font-semibold mt-1 leading-relaxed">
+                    {{ currentLang === 'km' ? 'កូដ QR នេះផុតកំណត់រួចហើយ។ សូមបង្កើតកូដថ្មីដើម្បីបន្តការទូទាត់។' : 'This QR code has expired. Generate a new one to continue with your payment.' }}
+                  </p>
+                </div>
+              </div>
+              <div class="grid grid-cols-2 gap-2">
+                <button
+                  @click="generateNewQr"
+                  type="button"
+                  class="bg-amber-600 hover:bg-amber-700 text-white rounded-xl py-2.5 font-black text-[10px] uppercase tracking-wider flex items-center justify-center gap-1.5 border-none cursor-pointer outline-none active:scale-95 transition-all"
+                >
+                  <span class="material-symbols-outlined text-sm">qr_code_2</span>
+                  {{ currentLang === 'km' ? 'បង្កើត QR ថ្មី' : 'Generate New QR' }}
+                </button>
+                <button
+                  @click="closePaymentModal"
+                  type="button"
+                  class="bg-white hover:bg-amber-50 text-amber-700 border border-amber-200 rounded-xl py-2.5 font-black text-[10px] uppercase tracking-wider flex items-center justify-center gap-1.5 cursor-pointer outline-none active:scale-95 transition-all"
+                >
+                  <span class="material-symbols-outlined text-sm">close</span>
+                  {{ currentLang === 'km' ? 'បោះបង់' : 'Cancel' }}
+                </button>
+              </div>
+            </div>
           </div>
 
-          <!-- Instruction Details below QR -->
+                    <!-- Instruction Details below QR -->
           <div class="mt-3.5 sm:mt-4 text-center space-y-1">
             <p class="text-xs font-black text-slate-800">{{ currentLang === 'km' ? 'សូមស្កេនជាមួយ TosEat ឬកម្មវិធីធនាគារនានា' : 'Scan with TosEat OS or Banking Apps' }}</p>
             <p class="text-[10px] sm:text-[11px] text-slate-500 font-bold leading-relaxed px-1">
@@ -1986,6 +2390,101 @@ onMounted(async () => {
             class="w-full bg-white border border-outline hover:bg-slate-50 text-slate-700 py-2.5 sm:py-3 rounded-xl font-black text-xs transition-all flex items-center justify-center outline-none cursor-pointer"
           >
             {{ currentLang === 'km' ? 'ត្រឡប់ក្រោយ' : 'Go Back' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- PAYMENT VERIFIED RECEIPT POPUP -->
+    <!-- Pops up automatically once a settlement succeeds: tangible proof that
+         the customer has paid for the food (ref, itemized lines, totals). It
+         stays on screen until the customer explicitly dismisses it. -->
+    <div 
+      v-if="isReceiptModalOpen && paymentReceipt"
+      class="fixed inset-0 bg-black/70 backdrop-blur-md z-[60] flex items-center justify-center p-4 animate-in fade-in duration-300 pointer-events-auto"
+    >
+      <div class="bg-white rounded-[32px] max-w-sm w-full max-h-[92vh] sm:max-h-[88vh] overflow-hidden flex flex-col shadow-2xl border border-surface-variant/40 animate-in fade-in zoom-in-95 duration-300 pointer-events-auto">
+        <!-- Verified Head -->
+        <div class="relative bg-emerald-50 p-5 border-b border-emerald-100 text-center shrink-0">
+          <button 
+            @click="isReceiptModalOpen = false"
+            class="absolute top-3 right-3 p-1.5 bg-white rounded-full hover:bg-surface-container text-outline hover:text-on-surface transition-all shadow-sm outline-none border-none cursor-pointer"
+          >
+            <span class="material-symbols-outlined text-base">close</span>
+          </button>
+          <div class="inline-flex items-center justify-center w-14 h-14 rounded-full bg-emerald-500 text-white shadow-lg shadow-emerald-500/30 mb-2">
+            <span class="material-symbols-outlined text-3xl font-black">verified</span>
+          </div>
+          <h3 class="text-base sm:text-lg font-black text-emerald-700">{{ currentLang === 'km' ? 'ការទូទាត់ប្រាក់បានបញ្ជាក់រួចរាល់' : 'Payment Verified' }}</h3>
+          <p class="text-[10px] sm:text-[11px] text-emerald-600/90 font-bold uppercase tracking-wider mt-0.5">{{ currentLang === 'km' ? 'អតិថិជនបានបង់ប្រាក់សម្រាប់មុខម្ហូបរួចរាល់' : 'Customer has paid for the food' }}</p>
+          <span class="inline-flex items-center gap-1 mt-2.5 bg-emerald-600 text-white text-[9px] font-black uppercase tracking-widest px-2.5 py-1 rounded-full shadow-sm">
+            <span class="material-symbols-outlined text-[11px]">task_alt</span>
+            {{ currentLang === 'km' ? 'បានបង់ប្រាក់' : 'PAID' }}
+          </span>
+        </div>
+
+        <!-- Receipt Ticket Body -->
+        <div class="flex-1 overflow-y-auto min-h-0 p-5 space-y-4 custom-scrollbar">
+          <!-- Meta -->
+          <div class="space-y-2 text-xs font-semibold text-slate-600">
+            <div class="flex justify-between">
+              <span>{{ currentLang === 'km' ? 'លេខប្រតិបត្តិការ៖' : 'Transaction Ref:' }}</span>
+              <span class="font-black font-mono text-[11px] text-slate-950">{{ paymentReceipt.id }}</span>
+            </div>
+            <div class="flex justify-between">
+              <span>{{ currentLang === 'km' ? 'កាលបរិច្ឆេទបានបង់៖' : 'Paid At:' }}</span>
+              <span class="text-slate-950">{{ new Date(paymentReceipt.timestamp).toLocaleDateString() }} - {{ new Date(paymentReceipt.timestamp).toLocaleTimeString() }}</span>
+            </div>
+            <div class="flex justify-between">
+              <span>{{ currentLang === 'km' ? 'វិធីសាស្ត្រទូទាត់៖' : 'Payment Method:' }}</span>
+              <span class="font-black text-slate-950 uppercase">{{ paymentReceipt.paymentMethod }}</span>
+            </div>
+            <div class="flex justify-between pb-2 border-b border-slate-100">
+              <span>{{ currentLang === 'km' ? 'លេខកៅអី/តុ៖' : 'Customer Desk:' }}</span>
+              <span class="font-black text-primary">{{ currentLang === 'km' ? 'តុ' : 'Table' }} {{ paymentReceipt.tableNo }}</span>
+            </div>
+          </div>
+
+          <!-- Itemized Lines -->
+          <div class="space-y-1.5 max-h-36 overflow-y-auto custom-scrollbar pr-0.5">
+            <div v-for="(item, idx) in paymentReceipt.items" :key="item.name + '-' + idx" class="flex justify-between text-xs text-slate-800">
+              <span class="truncate font-semibold">{{ translateDishName(item.name) }} <em class="text-slate-400 font-bold not-italic">×{{ item.quantity }}</em></span>
+              <span class="font-black text-slate-900">${{ (item.price * item.quantity).toFixed(2) }}</span>
+            </div>
+          </div>
+
+          <!-- Totals -->
+          <div class="border-t-2 border-dashed border-slate-200 pt-3 space-y-1.5 text-xs font-semibold text-slate-600">
+            <div class="flex justify-between">
+              <span>{{ currentLang === 'km' ? 'តម្លៃសរុបដើម៖' : 'Subtotal :' }}</span>
+              <span class="text-slate-950">${{ paymentReceipt.subtotal.toFixed(2) }}</span>
+            </div>
+            <div class="flex justify-between">
+              <span>{{ currentLang === 'km' ? 'ពន្ធអាករ (10%)៖' : 'VAT (10%) :' }}</span>
+              <span class="text-slate-950">${{ paymentReceipt.tax.toFixed(2) }}</span>
+            </div>
+            <div class="flex justify-between">
+              <span>{{ currentLang === 'km' ? 'សេវាកម្ម (5%)៖' : 'Service Fee (5%) :' }}</span>
+              <span class="text-slate-950">${{ paymentReceipt.serviceFee.toFixed(2) }}</span>
+            </div>
+            <div class="flex justify-between text-sm pt-2 border-t-2 border-dashed border-slate-200">
+              <span class="font-black text-slate-950">{{ currentLang === 'km' ? 'ប្រាក់បានបង់៖' : 'Amount Paid:' }}</span>
+              <span class="font-black text-emerald-600 font-display">${{ paymentReceipt.total.toFixed(2) }}</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Footer -->
+        <div class="p-4 sm:p-5 bg-slate-50 border-t border-slate-100 shrink-0 space-y-3">
+          <p class="text-[10px] text-slate-500 font-bold text-center leading-relaxed px-2">
+            {{ currentLang === 'km' ? 'សូមរក្សាទុកវិក្កយបត្រនេះជាភស្តុតាងនៃការទូទាត់ប្រាក់។ អរគុណសម្រាប់ការពិសាអាហារ!' : 'Keep this receipt as proof of payment. Thank you for dining with us!' }}
+          </p>
+          <button 
+            @click="isReceiptModalOpen = false"
+            class="w-full bg-emerald-600 hover:bg-emerald-700 text-white py-2.5 sm:py-3 rounded-xl font-black text-xs uppercase tracking-wider transition-all flex items-center justify-center gap-2 outline-none border-none cursor-pointer active:scale-95"
+          >
+            <span class="material-symbols-outlined text-sm">check_circle</span>
+            {{ currentLang === 'km' ? 'រួចរាល់' : 'Done' }}
           </button>
         </div>
       </div>

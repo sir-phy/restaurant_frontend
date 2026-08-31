@@ -1,9 +1,14 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
+import { ref, onMounted, onUnmounted, computed, watch, nextTick } from 'vue'
 import * as d3 from 'd3'
 import { t, currentLang, translateDishName, translateDishDesc, translateIngredient } from '../i18n'
 import { menuService } from '../services/menu.js'
 import { getAccessToken } from '../services/api.js'
+import { currentUser } from '../services/auth.js'
+
+// Manager-only features (image upload + inline category creation) are gated on
+// this flag so non-managers never see the controls.
+const isManager = computed(() => currentUser.value?.role === 'MANAGER')
 
 const translateCategoryName = (name: string): string => {
   if (currentLang.value === 'km') {
@@ -238,6 +243,125 @@ const newIngredient = ref('')
 const newIngName = ref('')
 const newIngAmount = ref<number>(1)
 const newIngUnit = ref<'kg' | 'pcs' | 'g' | 'portions'>('pcs')
+
+// ── Image upload (Manager only) ─────────────────────────────────────────
+// `imageUploading` toggles the spinner/disable state while the base64 payload
+// is in flight. `imageUploadInput` is the hidden <input type=file> ref.
+const imageUploading = ref(false)
+const imageUploadInput = ref<HTMLInputElement | null>(null)
+
+const triggerImageUpload = () => {
+  imageUploadInput.value?.click()
+}
+
+const handleImageUpload = async (event: Event) => {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+
+  // Accept only image files, capped at 5 MB (matches the backend limit).
+  if (!file.type.startsWith('image/')) {
+    showToast('Please select an image file (PNG, JPG, WEBP, GIF)', 'error')
+    return
+  }
+  if (file.size > 5 * 1024 * 1024) {
+    showToast('Image is too large (max 5MB)', 'error')
+    return
+  }
+
+  imageUploading.value = true
+  try {
+    // Convert the file to a data-URL so it round-trips through the same
+    // base64 upload endpoint the mobile clients use.
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => resolve(reader.result as string)
+      reader.onerror = () => reject(new Error('Failed to read file'))
+      reader.readAsDataURL(file)
+    })
+
+    const res = await menuService.uploadMenuItemImage(dataUrl, file.name)
+    if (res.data?.url) {
+      editingItem.value.image = res.data.url
+      showToast('Image uploaded ✓', 'success')
+    } else {
+      throw new Error('No URL returned')
+    }
+  } catch (err: any) {
+    const msg = err?.message || 'Failed to upload image'
+    showToast(msg, 'error')
+  } finally {
+    imageUploading.value = false
+    // Reset the input so the same file can be re-selected later.
+    if (input) input.value = ''
+  }
+}
+
+// ── Inline category creation (Manager only) ─────────────────────────────
+// When the manager picks "+ Create new category" from the dropdown, this flag
+// reveals an inline input. On Enter / blur the category is created in the DB
+// and immediately selected.
+const showNewCategoryInput = ref(false)
+const newCategoryName = ref('')
+const newCategorySaving = ref(false)
+const newCategoryInput = ref<HTMLInputElement | null>(null)
+
+// When the manager selects "+ Create new category" from the dropdown, flip
+// into the inline input mode. Any other selection dismisses it.
+watch(() => editingItem.value?.category, (val) => {
+  if (val === '__create_new__') {
+    showNewCategoryInput.value = true
+  } else if (showNewCategoryInput.value && val !== undefined) {
+    showNewCategoryInput.value = false
+    newCategoryName.value = ''
+  }
+})
+
+// Auto-focus the inline category input the moment it appears.
+watch(showNewCategoryInput, (visible) => {
+  if (visible) {
+    nextTick(() => newCategoryInput.value?.focus())
+  }
+})
+
+const createCategoryInline = async () => {
+  const name = newCategoryName.value.trim()
+  if (!name) {
+    showNewCategoryInput.value = false
+    return
+  }
+  // Avoid duplicating an existing category (case-insensitive).
+  const exists = categories.value.some(
+    (c: any) => c.name.toLowerCase() === name.toLowerCase()
+  )
+  if (exists) {
+    showToast('A category with this name already exists', 'error')
+    return
+  }
+
+  newCategorySaving.value = true
+  try {
+    const res = await menuService.createCategory({ name, status: 'ACTIVE' })
+    const created = res.data as any
+    if (created) {
+      // Add to the local category list and select it.
+      categories.value.push({
+        name: created.name,
+        icon: created.icon || 'restaurant',
+        active: false
+      })
+      editingItem.value.category = created.name
+      showToast('Category created ✓', 'success')
+    }
+  } catch (err: any) {
+    const msg = err?.message || 'Failed to create category'
+    showToast(msg, 'error')
+  } finally {
+    newCategorySaving.value = false
+    newCategoryName.value = ''
+    showNewCategoryInput.value = false
+  }
+}
 
 // Search & Filtering
 const searchQuery = ref('')
@@ -1160,10 +1284,40 @@ watch(currentLang, () => {
                 >
                   {{ cat.name }}
                 </option>
+                <option v-if="isManager" value="__create_new__" class="text-primary font-black">+ Create new category</option>
               </select>
+              <!-- Inline category creation (Manager only, revealed when the
+                   "+ Create new category" option is selected). -->
+              <div v-if="isManager && showNewCategoryInput" class="mt-3 flex gap-2">
+                <input 
+                  ref="newCategoryInput"
+                  v-model="newCategoryName"
+                  type="text"
+                  maxlength="40"
+                  class="flex-1 bg-surface-container rounded-xl p-3 font-bold border-2 border-primary outline-none transition-all text-sm"
+                  placeholder="New category name..."
+                  @keyup.enter="createCategoryInline"
+                  @keyup.escape="showNewCategoryInput = false; newCategoryName = ''"
+                />
+                <button 
+                  type="button"
+                  :disabled="newCategorySaving"
+                  @click="createCategoryInline"
+                  class="px-4 py-2 bg-primary text-white rounded-xl font-black text-xs hover:opacity-90 disabled:opacity-50 transition-all"
+                >
+                  {{ newCategorySaving ? '...' : 'Add' }}
+                </button>
+                <button 
+                  type="button"
+                  @click="showNewCategoryInput = false; newCategoryName = ''"
+                  class="px-3 py-2 border-2 border-outline-variant rounded-xl text-outline hover:bg-surface-container transition-colors"
+                >
+                  <span class="material-symbols-outlined text-base">close</span>
+                </button>
+              </div>
             </div>
             <div class="col-span-2">
-              <label class="block text-xs font-black uppercase tracking-widest text-on-surface-variant mb-2">Image URL</label>
+              <label class="block text-xs font-black uppercase tracking-widest text-on-surface-variant mb-2">Image</label>
               <div class="flex gap-4 items-center">
                 <input 
                   v-model="editingItem.image"
@@ -1174,6 +1328,26 @@ watch(currentLang, () => {
                   <img v-if="editingItem.image" :src="editingItem.image" class="w-full h-full object-cover" @error="(e) => (e.target as HTMLImageElement).src = 'https://images.unsplash.com/photo-1546069901-ba9599a7e63c?auto=format&fit=crop&q=80&w=400'" />
                   <span v-else class="material-symbols-outlined text-outline">image</span>
                 </div>
+              </div>
+              <!-- Image upload (Manager only) — converts the picked file to a
+                   data-URL and POSTs it to /api/upload/image. -->
+              <div v-if="isManager" class="mt-3">
+                <input 
+                  ref="imageUploadInput"
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp,image/gif"
+                  class="hidden"
+                  @change="handleImageUpload"
+                />
+                <button 
+                  type="button"
+                  :disabled="imageUploading"
+                  @click="triggerImageUpload"
+                  class="flex items-center gap-2 px-4 py-2.5 bg-primary-container text-on-primary-container rounded-xl font-black text-xs hover:opacity-90 disabled:opacity-50 transition-all"
+                >
+                  <span class="material-symbols-outlined text-sm">{{ imageUploading ? 'hourglass_top' : 'upload' }}</span>
+                  {{ imageUploading ? 'Uploading...' : 'Upload Image' }}
+                </button>
               </div>
             </div>
           </div>

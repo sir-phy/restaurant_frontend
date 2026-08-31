@@ -34,7 +34,18 @@ export interface MenuItemData {
   ingredients: MenuItemIngredientDef[]
 }
 
+export interface UploadedImage {
+  url: string
+  filename: string
+  mime: string
+  size: number
+}
+
 export const menuService = {
+  // Image upload (Manager only)
+  uploadMenuItemImage: (image: string, filename?: string) =>
+    api.post<UploadedImage>('/upload/image', { image, filename }),
+
   // Categories
   getCategories: () => api.get<CategoryItem[]>('/categories'),
   getCategory: (id: number) => api.get<CategoryItem>(`/categories/${id}`),

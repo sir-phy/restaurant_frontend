@@ -12,6 +12,7 @@ import { billingRequestsRouter } from './routes/billingRequests.js'
 import { cashierRouter } from './routes/cashier.js'
 import { paymentsRouter } from './routes/payments.js'
 import { invoicesRouter } from './routes/invoices.js'
+import { uploadRouter } from './routes/upload.js'
 
 export const createExpressApp = () => {
   const app = express()
@@ -44,6 +45,7 @@ export const createExpressApp = () => {
   app.use('/api/cashier', cashierRouter)
   app.use('/api/payments', paymentsRouter)
   app.use('/api/invoices', invoicesRouter)
+  app.use('/api/upload', uploadRouter)
 
   // Root API status endpoint
   app.get('/api', (_req: Request, res: Response) => {

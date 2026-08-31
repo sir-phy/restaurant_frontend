@@ -22,6 +22,22 @@ export interface PaymentItem {
   expiresAt?: string
 }
 
+/** Response of POST /api/payments/khqr/create (get-or-create semantics). */
+export interface KhqrCreateResult {
+  paymentId: number
+  transactionNumber: string
+  billingRequestId?: number
+  tableId?: number
+  amount: number
+  currency: string
+  status: 'PENDING' | 'PAID'
+  /** Dynamic KHQR payload — render it as-is, never rebuild it client-side. */
+  qrPayload: string
+  expiresAt?: string
+  /** True when an existing PENDING/PROCESSING payment was returned as-is. */
+  alreadyPending?: boolean
+}
+
 export const paymentService = {
   // Cash payment
   payCash: (data: { billingRequestId?: number; orderId?: number; tableId?: number; amountReceived: number }) =>
@@ -34,29 +50,25 @@ export const paymentService = {
       orderId: number
       amount: number
       currency: string
-      amountKHR: number
-      qrString: string
-      md5: string
-      shortHash: string
+      status: 'PENDING' | 'PAID'
+      /** Dynamic KHQR payload — render it as-is, never rebuild it client-side. */
+      qr: string
       expiresAt: string
     }>('/payments/khqr', { orderId }),
 
-  // KHQR payment for table billing request (cashier POS)
+  // KHQR payment for a table billing request (cashier POS or the requesting
+  // customer). Idempotent: when a PENDING/PROCESSING payment already exists the
+  // SAME payment (original QR) is returned with alreadyPending: true, so page
+  // refreshes can never create a second payment.
   generateBillingKHQR: (billingRequestId: number | string) =>
-    api.post<{
-      paymentId: number
-      billingRequestId: number
-      tableNumber: string
-      amount: number
-      currency: string
-      amountKHR: number
-      qrString: string
-      md5: string
-      shortHash: string
-      expiresAt: string
-    }>('/payments/khqr/create', { billingRequestId }),
+    api.post<KhqrCreateResult>('/payments/khqr/create', { billingRequestId }),
 
-  // Check KHQR payment with Bakong
+  // Customer "resume my table payment" locator — resolves the caller's own
+  // active billing request for the table and returns (or creates) its payment.
+  generateTableKHQR: (tableId: number | string) =>
+    api.post<KhqrCreateResult>('/payments/khqr/create', { tableId }),
+
+  // Check KHQR payment with Bakong (cashier/manager screens)
   checkKHQR: (paymentId: number) =>
     api.post<{
       paymentId: number
@@ -67,22 +79,36 @@ export const paymentService = {
       isPaid: boolean
     }>('/payments/khqr/check', { paymentId }),
 
-  // Get payment status (polling payload)
+  // Get payment status (polling payload — lazy-marks expired KHQR payments)
   getPaymentStatus: (paymentId: number | string) =>
     api.get<{
       paymentId: number
-      status: string
-      method: string
+      status: 'PENDING' | 'PROCESSING' | 'PAID' | 'FAILED' | 'CANCELLED' | 'EXPIRED' | 'REFUNDED'
       amount: number
       currency: string
+      /** Bakong transaction hash — present once the payment is verified. */
+      transactionHash?: string
+      shortHash?: string
       paidAt?: string
-      isExpired: boolean
-      isPaid: boolean
+      /** Backend-generated invoice id — fetch it to render the receipt. */
+      invoiceId?: number
+      expiresAt?: string
     }>(`/payments/${paymentId}/status`),
 
-  // Verify payment settlement
+  // Ask the backend to verify the payment against Bakong (stored QR MD5).
+  // The backend decides PAID/FAILED — the frontend never declares success.
   verifyPayment: (paymentId: number | string) =>
-    api.post<{ payment: PaymentItem; invoice: any }>(`/payments/${paymentId}/verify`),
+    api.post<{ message: string; paymentId: number; status: string } & Record<string, any>>(
+      `/payments/${paymentId}/verify`
+    ),
+
+  // SANDBOX ONLY (server returns 403 unless BAKONG_SANDBOX=true): asks the
+  // BACKEND to settle this KHQR payment through the real settlement + invoice
+  // path. Success is still confirmed via getPaymentStatus polling.
+  sandboxSettlePayment: (paymentId: number | string) =>
+    api.post<{ message: string; paymentId: number; status: string } & Record<string, any>>(
+      `/payments/${paymentId}/sandbox-settle`
+    ),
 
   // Card payment
   payCard: (data: { billingRequestId?: number; orderId?: number; tableId?: number; transactionReference?: string }) =>
