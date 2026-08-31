@@ -2,6 +2,7 @@
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import * as d3 from 'd3'
 import { t, currentLang, setLang, translateDishName } from '../i18n'
+import { menuService, type TopMenuItem } from '../services/menu.js'
 
 interface SettleTransaction {
   id: string
@@ -35,6 +36,7 @@ interface OrderItem {
 const activeOrders = ref<OrderItem[]>([])
 const payoutHistory = ref<SettleTransaction[]>([])
 const ticketHistory = ref<any[]>([])
+const topItemsFromApi = ref<TopMenuItem[]>([])
 
 const selectedTimeframe = ref<'Day' | 'Week' | 'Month'>('Week')
 const selectedMetric = ref<'sales' | 'covers'>('sales')
@@ -188,6 +190,15 @@ const salesHistoryChartData = computed(() => {
 
 // Category Breakdown Calculations for analytics
 const popularDishRanking = computed(() => {
+  if (topItemsFromApi.value.length > 0) {
+    return topItemsFromApi.value.slice(0, 10).map((item) => ({
+      name: item.name,
+      totalSales: Number(item.revenue),
+      count: Number(item.soldCount),
+      category: item.category || 'Others',
+    }))
+  }
+
   const dictionary: { [key: string]: { name: string; totalSales: number; count: number; category: string } } = {}
 
   // Aggregate quantity and amounts
@@ -211,7 +222,7 @@ const popularDishRanking = computed(() => {
   });
 
   const list = Object.values(dictionary)
-  return list.sort((a, b) => b.totalSales - a.totalSales)
+  return list.sort((a, b) => b.totalSales - a.totalSales).slice(0, 10)
 })
 
 // Dynamic Table Efficiency rating
@@ -539,6 +550,12 @@ const loadData = () => {
       console.error(e)
     }
   }
+
+  menuService.getTopItems(10).then((res) => {
+    topItemsFromApi.value = Array.isArray(res.data) ? res.data : []
+  }).catch(() => {
+    topItemsFromApi.value = []
+  })
 }
 
 watch(currentLang, () => {
@@ -931,7 +948,7 @@ onUnmounted(() => {
         <div>
           <h3 class="font-black text-sm text-slate-900 uppercase tracking-widest flex items-center gap-1.5">
             <span class="material-symbols-outlined text-emerald-600 text-base">restaurant_menu</span>
-            {{ currentLang === 'km' ? 'សន្ទស្សន៍ប្រសិទ្ធភាពម្ហូបក្នុងបញ្ជីពេញនិយម' : 'Popular Menu Item Performance Metrics' }}
+            {{ currentLang === 'km' ? 'ម្ហូប Top 10' : 'Top 10 Most Ordered' }}
           </h3>
           <p class="text-[10px] text-slate-400 font-bold mt-0.5">
             {{ currentLang === 'km' ? 'ការគណនាចំណាត់ថ្នាក់មុខម្ហូបដែលបានលក់សរុបទាំងអស់' : 'Calculated rankings of products sorted by total aggregate sales' }}

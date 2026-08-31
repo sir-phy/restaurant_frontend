@@ -24,28 +24,26 @@ export const getSocket = (): Socket => {
     reconnectionDelay: 1000
   })
 
-  socketInstance.on('connect', () => {
-    console.log('⚡ Connected to GoMeal Real-Time Socket.IO Server [ID:', socketInstance?.id, ']')
-  })
-
   socketInstance.on('connect_error', (err) => {
     console.warn('Socket connect error:', err.message)
-  })
-
-  socketInstance.on('disconnect', (reason) => {
-    console.log('Socket disconnected:', reason)
   })
 
   return socketInstance
 }
 
-export const joinTableRoom = (tableId: number | string): Promise<boolean> => {
+export const joinTableRoom = (
+  tableId: number | string,
+): Promise<{ ok: boolean; tableId?: number }> => {
   return new Promise((resolve) => {
     const socket = getSocket()
-    if (!tableId) return resolve(false)
-    socket.emit('join:table', tableId, (res: { ok: boolean }) => {
-      resolve(res ? res.ok : true)
-    })
+    if (!tableId) return resolve({ ok: false })
+    socket.emit(
+      'join:table',
+      tableId,
+      (res: { ok: boolean; tableId?: number }) => {
+        resolve(res ?? { ok: true })
+      },
+    )
   })
 }
 

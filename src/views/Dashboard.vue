@@ -3,8 +3,12 @@ import { ref, onMounted, onUnmounted, computed, watch, nextTick } from 'vue'
 import * as d3 from 'd3'
 import { t, currentLang, translateDishName, translateDishDesc, translateIngredient } from '../i18n'
 import { menuService } from '../services/menu.js'
+import type { TopMenuItem } from '../services/menu.js'
 import { getAccessToken } from '../services/api.js'
 import { currentUser } from '../services/auth.js'
+import { resolveMediaUrl } from '../services/config.js'
+import OffersBoard from '../components/OffersBoard.vue'
+import { promotionService, type Promotion } from '../services/offers.js'
 
 // Manager-only features (image upload + inline category creation) are gated on
 // this flag so non-managers never see the controls.
@@ -174,6 +178,22 @@ const loadMenuItems = () => {
 }
 
 const menuItems = ref(loadMenuItems())
+const topSellingItems = ref<TopMenuItem[]>([])
+const activePromos = ref<Promotion[]>([])
+
+const promoByMenuItemId = computed(() => {
+  const map: Record<number, Promotion> = {}
+  for (const promo of activePromos.value) {
+    if (String(promo.status || 'ACTIVE').toUpperCase() !== 'ACTIVE') continue
+    map[Number(promo.menuItemId)] = promo
+  }
+  return map
+})
+
+const getItemPromo = (item: { id?: number } | null | undefined) => {
+  if (item?.id == null) return undefined
+  return promoByMenuItemId.value[Number(item.id)]
+}
 
 watch(menuItems, () => {
   localStorage.setItem('gomeal_menu_items', JSON.stringify(menuItems.value))
@@ -198,6 +218,12 @@ const refreshMenuFromBackend = async () => {
     }
 
     const itemsRes = await menuService.getMenuItems()
+    try {
+      const promoRes = await promotionService.list('ACTIVE')
+      activePromos.value = Array.isArray(promoRes.data) ? promoRes.data : []
+    } catch {
+      activePromos.value = []
+    }
     if (itemsRes.data && Array.isArray(itemsRes.data) && itemsRes.data.length > 0) {
       menuItems.value = itemsRes.data.map((i: any) => ({
         id: i.id,
@@ -216,6 +242,9 @@ const refreshMenuFromBackend = async () => {
     } else {
       menuItems.value = []
     }
+
+    const topRes = await menuService.getTopItems(10)
+    topSellingItems.value = Array.isArray(topRes.data) ? topRes.data : []
   } catch (err) {
     console.log('Backend menu data load notice:', err)
   }
@@ -506,6 +535,124 @@ const clearSelection = () => {
   selectedItems.value = []
 }
 
+const removeItemLocally = (id: number) => {
+  menuItems.value = menuItems.value.filter((item: any) => item.id !== id)
+  selectedItems.value = selectedItems.value.filter((sid: number) => sid !== id)
+}
+
+const deleteMenuItemOnServer = async (id: number): Promise<'deleted' | 'deactivated'> => {
+  try {
+    await menuService.deleteMenuItem(id)
+    return 'deleted'
+  } catch (err: any) {
+    const msg = String(err?.message || '')
+    if (/cannot delete menu item/i.test(msg) || /has orders/i.test(msg)) {
+      await menuService.updateMenuItemStatus(id, 'INACTIVE')
+      return 'deactivated'
+    }
+    throw err
+  }
+}
+
+const itemPendingDelete = ref<any>(null)
+const itemsPendingBulkDelete = ref<number[]>([])
+const isDeleteModalOpen = ref(false)
+const isDeleting = ref(false)
+
+const askDeleteItem = (item: any) => {
+  if (!isManager.value) {
+    showToast('Please log in as a Manager to delete menu items.', 'error')
+    return
+  }
+  itemsPendingBulkDelete.value = []
+  itemPendingDelete.value = item
+  isDeleteModalOpen.value = true
+}
+
+const askBulkDelete = () => {
+  if (!isManager.value) {
+    showToast('Please log in as a Manager to delete menu items.', 'error')
+    return
+  }
+  if (selectedItems.value.length === 0) return
+  itemPendingDelete.value = null
+  itemsPendingBulkDelete.value = [...selectedItems.value]
+  isDeleteModalOpen.value = true
+}
+
+const closeDeleteModal = () => {
+  if (isDeleting.value) return
+  isDeleteModalOpen.value = false
+  itemPendingDelete.value = null
+  itemsPendingBulkDelete.value = []
+}
+
+const confirmDelete = async () => {
+  if (!getAccessToken()) {
+    showToast('Please log in as a Manager to delete menu items.', 'error')
+    return
+  }
+
+  const ids = itemPendingDelete.value
+    ? [itemPendingDelete.value.id]
+    : [...itemsPendingBulkDelete.value]
+  if (ids.length === 0) return
+
+  isDeleting.value = true
+  let deleted = 0
+  let deactivated = 0
+  let failed = 0
+
+  try {
+    for (const id of ids) {
+      try {
+        const result = await deleteMenuItemOnServer(id)
+        removeItemLocally(id)
+        if (result === 'deactivated') deactivated++
+        else deleted++
+      } catch {
+        failed++
+      }
+    }
+
+    isDeleteModalOpen.value = false
+    itemPendingDelete.value = null
+    itemsPendingBulkDelete.value = []
+
+    if (failed && !deleted && !deactivated) {
+      showToast(
+        currentLang.value === 'km'
+          ? 'មិនអាចលុបមុខម្ហូបបានទេ'
+          : 'Could not delete the menu item.',
+        'error',
+      )
+    } else if (deactivated && !deleted) {
+      showToast(
+        currentLang.value === 'km'
+          ? 'មុខម្ហូបនេះមានការកុម្ម៉ង់ហើយ ដូច្នេះបានបិទការលក់ជំនួសការលុប។'
+          : 'This item has existing orders, so it was deactivated instead of deleted.',
+        'success',
+      )
+    } else if (failed) {
+      showToast(
+        currentLang.value === 'km'
+          ? `បានលុប ${deleted + deactivated} មុខ។ មិនបាន ${failed} មុខ។`
+          : `Removed ${deleted + deactivated} item(s). ${failed} could not be removed.`,
+        'error',
+      )
+    } else {
+      showToast(
+        currentLang.value === 'km'
+          ? 'បានលុបមុខម្ហូបដោយជោគជ័យ'
+          : ids.length > 1 ? 'Menu items deleted.' : 'Menu item deleted.',
+        'success',
+      )
+    }
+  } finally {
+    isDeleting.value = false
+  }
+}
+
 // Bulk Actions
 const bulkOutOfStock = () => {
   menuItems.value.forEach((item: any) => {
@@ -514,15 +661,6 @@ const bulkOutOfStock = () => {
     }
   })
   clearSelection()
-}
-
-const bulkDelete = () => {
-  menuItems.value = menuItems.value.filter((item: any) => !selectedItems.value.includes(item.id))
-  clearSelection()
-}
-
-const deleteItem = (id: number) => {
-  menuItems.value = menuItems.value.filter((item: any) => item.id !== id)
 }
 
 // Modal logic
@@ -1052,13 +1190,19 @@ watch(currentLang, () => {
               </div>
 
               <div class="relative h-44 w-full overflow-hidden p-4">
-                <img :src="item.image" :alt="item.name" class="w-full h-full object-contain transform group-hover:scale-105 transition-transform duration-500" />
+                <img :src="resolveMediaUrl(item.image)" :alt="item.name" class="w-full h-full object-contain transform group-hover:scale-105 transition-transform duration-500" />
                 <div class="absolute top-4 right-4 flex flex-col gap-1 items-end">
                   <span 
                     class="px-2.5 py-1 rounded-lg text-[10px] font-black uppercase tracking-tighter shadow-sm"
                     :class="item.status === 'Available' ? 'bg-tertiary-container text-on-tertiary-container' : 'bg-secondary-container text-on-secondary-container'"
                   >
                     {{ item.status === 'Available' ? (currentLang === 'km' ? 'មានលក់' : 'Available') : (currentLang === 'km' ? 'អស់ហើយ' : 'Sold Out') }}
+                  </span>
+                  <span
+                    v-if="getItemPromo(item)"
+                    class="bg-secondary text-white px-2.5 py-1 rounded-lg text-[10px] font-black uppercase tracking-tighter shadow-sm"
+                  >
+                    {{ currentLang === 'km' ? 'ប្រម៉ូ ' : '' }}{{ Number(getItemPromo(item)?.discountPercent) }}% Off
                   </span>
                   <span v-if="item.lowStock" class="bg-secondary text-white px-2.5 py-1 rounded-lg text-[10px] font-black uppercase tracking-tighter shadow-sm">
                     {{ currentLang === 'km' ? 'ស្តុកតិចតួច' : 'Low Stock' }}
@@ -1090,9 +1234,10 @@ watch(currentLang, () => {
                 <div class="flex items-center justify-between mt-auto">
                   <div>
                     <p class="text-[9px] font-bold text-on-surface-variant uppercase tracking-widest leading-none mb-1">
-                      {{ currentLang === 'km' ? 'តម្លៃ' : 'Price' }}
+                      {{ getItemPromo(item) ? (currentLang === 'km' ? 'តម្លៃប្រម៉ូ' : 'Promo price') : (currentLang === 'km' ? 'តម្លៃ' : 'Price') }}
                     </p>
-                    <p class="text-lg font-black text-primary">${{ item.price.toFixed(2) }}</p>
+                    <p class="text-lg font-black text-primary">${{ Number(getItemPromo(item)?.promoPrice ?? item.price).toFixed(2) }}</p>
+                    <p v-if="getItemPromo(item)" class="text-[10px] text-outline font-bold line-through">${{ Number(item.price).toFixed(2) }}</p>
                   </div>
                   <div class="flex gap-1.5">
                     <button 
@@ -1102,8 +1247,10 @@ watch(currentLang, () => {
                       <span class="material-symbols-outlined text-[18px]">edit</span>
                     </button>
                     <button 
-                      @click.stop="deleteItem(item.id)"
+                      type="button"
+                      @click.stop="askDeleteItem(item)"
                       class="p-2 rounded-full bg-error-container/10 hover:bg-error hover:text-on-error transition-all"
+                      :title="currentLang === 'km' ? 'លុបមុខម្ហូប' : 'Delete item'"
                     >
                       <span class="material-symbols-outlined text-[18px] text-error hover:text-inherit">delete</span>
                     </button>
@@ -1119,6 +1266,12 @@ watch(currentLang, () => {
           </div>
         </div>
       </section>
+
+      <OffersBoard
+        :manage="isManager"
+        :menu-items="menuItems"
+        @toast="showToast"
+      />
 
       <!-- Chart and Top Items -->
       <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
@@ -1140,26 +1293,34 @@ watch(currentLang, () => {
           <div ref="chartContainer" class="w-full h-[300px]"></div>
         </div>
 
-        <!-- Top Selling -->
+        <!-- Top 10 -->
         <div class="bg-white p-8 rounded-3xl shadow-sm border border-surface-variant">
-          <h3 class="text-xl font-black text-on-surface mb-6">{{ currentLang === 'km' ? 'មុខម្ហូបលក់ដាច់បំផុត' : 'Top Selling Items' }}</h3>
-          <div class="space-y-6">
-            <div v-for="i in 3" :key="i" class="flex items-center gap-4">
-              <div class="w-16 h-16 rounded-2xl overflow-hidden shrink-0 border border-surface-variant">
-                <img src="https://images.unsplash.com/photo-1568901346375-23c9450c58cd?auto=format&fit=crop&q=80&w=150" class="w-full h-full object-cover">
+          <h3 class="text-xl font-black text-on-surface mb-1">{{ currentLang === 'km' ? 'ម្ហូប Top 10' : 'Top 10' }}</h3>
+          <p class="text-[10px] font-bold text-on-surface-variant uppercase tracking-widest mb-6">{{ currentLang === 'km' ? 'មុខម្ហូបដែលអតិថិជនកុម្ម៉ង់ច្រើនបំផុត' : 'Most ordered by customers' }}</p>
+          <div v-if="topSellingItems.length === 0" class="text-center py-8">
+            <p class="text-sm font-black text-on-surface-variant">{{ currentLang === 'km' ? 'មិនទាន់មានចំណាត់ថ្នាក់លក់' : 'No ranked dishes yet' }}</p>
+            <p class="text-xs text-outline font-bold mt-1">{{ currentLang === 'km' ? 'នឹងបង្ហាញពេលមានការកុម្ម៉ង់។' : 'Appears after customers place orders.' }}</p>
+          </div>
+          <div v-else class="space-y-5 max-h-[340px] overflow-y-auto custom-scrollbar pr-1">
+            <div v-for="item in topSellingItems" :key="item.id" class="flex items-center gap-4">
+              <span
+                class="w-7 h-7 rounded-full shrink-0 flex items-center justify-center text-[10px] font-black"
+                :class="item.rank === 1 ? 'bg-primary text-white' : item.rank === 2 ? 'bg-on-surface-variant text-white' : item.rank === 3 ? 'bg-secondary text-white' : 'bg-surface-container text-on-surface'"
+              >{{ item.rank }}</span>
+              <div class="w-14 h-14 rounded-2xl overflow-hidden shrink-0 border border-surface-variant bg-surface-container">
+                <img :src="resolveMediaUrl(item.image)" :alt="item.name" class="w-full h-full object-cover">
               </div>
-              <div class="flex-1">
-                <h4 class="text-sm font-black text-on-surface">{{ translateDishName('Double Burger') }}</h4>
-                <p class="text-[10px] font-bold text-on-surface-variant uppercase">{{ currentLang === 'km' ? '៣៤០ ការកុម្ម៉ង់' : '340 Orders' }}</p>
+              <div class="flex-1 min-w-0">
+                <h4 class="text-sm font-black text-on-surface truncate">{{ translateDishName(item.name) }}</h4>
+                <p class="text-[10px] font-bold text-on-surface-variant uppercase">
+                  {{ currentLang === 'km' ? item.soldCount + ' ការកុម្ម៉ង់' : item.soldCount + (item.soldCount === 1 ? ' order' : ' orders') }}
+                </p>
               </div>
-              <div class="text-right">
-                <p class="text-lg font-black text-primary">$1,894</p>
+              <div class="text-right shrink-0">
+                <p class="text-lg font-black text-primary">${{ Number(item.revenue).toFixed(0) }}</p>
               </div>
             </div>
           </div>
-          <button class="w-full mt-10 py-3 border-2 border-surface-variant rounded-xl text-xs font-black text-on-surface-variant hover:bg-surface-container transition-all">
-            {{ currentLang === 'km' ? 'មើលរបាយការណ៍ស្តុកទំនិញ' : 'View Inventory Report' }}
-          </button>
         </div>
       </div>
 
@@ -1325,7 +1486,7 @@ watch(currentLang, () => {
                   placeholder="Paste food image URL here..."
                 />
                 <div class="w-16 h-16 rounded-2xl bg-surface-container-high overflow-hidden shrink-0 border-2 border-surface-variant flex items-center justify-center">
-                  <img v-if="editingItem.image" :src="editingItem.image" class="w-full h-full object-cover" @error="(e) => (e.target as HTMLImageElement).src = 'https://images.unsplash.com/photo-1546069901-ba9599a7e63c?auto=format&fit=crop&q=80&w=400'" />
+                  <img v-if="editingItem.image" :src="resolveMediaUrl(editingItem.image)" class="w-full h-full object-cover" />
                   <span v-else class="material-symbols-outlined text-outline">image</span>
                 </div>
               </div>
@@ -1470,6 +1631,56 @@ watch(currentLang, () => {
       </div>
     </div>
 
+    <!-- Delete confirmation -->
+    <div v-if="isDeleteModalOpen" class="fixed inset-0 z-[110] flex items-center justify-center p-4">
+      <div class="absolute inset-0 bg-on-surface/40 backdrop-blur-sm" @click="closeDeleteModal"></div>
+      <div class="bg-white w-full max-w-md rounded-[32px] shadow-2xl relative overflow-hidden p-8">
+        <div class="w-14 h-14 rounded-2xl bg-error/10 text-error flex items-center justify-center mb-5">
+          <span class="material-symbols-outlined text-3xl">delete</span>
+        </div>
+        <h3 class="text-xl font-black text-on-surface">
+          {{ currentLang === 'km' ? 'លុបមុខម្ហូប?' : (itemsPendingBulkDelete.length > 1 ? 'Delete menu items?' : 'Delete menu item?') }}
+        </h3>
+        <p class="text-sm font-medium text-on-surface-variant mt-2 leading-relaxed">
+          <template v-if="itemPendingDelete">
+            {{ currentLang === 'km'
+              ? `តើអ្នកចង់លុប “${translateDishName(itemPendingDelete.name)}” ពីម៉ឺនុយមែនទេ?`
+              : `Remove “${itemPendingDelete.name}” from the menu?` }}
+          </template>
+          <template v-else>
+            {{ currentLang === 'km'
+              ? `តើអ្នកចង់លុបមុខម្ហូប ${itemsPendingBulkDelete.length} មុខនេះមែនទេ?`
+              : `Remove ${itemsPendingBulkDelete.length} selected items from the menu?` }}
+          </template>
+        </p>
+        <p class="text-xs font-bold text-on-surface-variant mt-3">
+          {{ currentLang === 'km'
+            ? 'បើមុខម្ហូបនេះមានការកុម្ម៉ង់រួចហើយ វានឹងត្រូវបានបិទការលក់ជំនួសការលុប។'
+            : 'If the item already has orders, it will be deactivated instead of permanently deleted.' }}
+        </p>
+        <div class="flex gap-3 mt-8">
+          <button
+            type="button"
+            :disabled="isDeleting"
+            @click="closeDeleteModal"
+            class="flex-1 py-3.5 rounded-2xl font-black text-sm border-2 border-outline-variant hover:bg-surface-variant transition-colors text-on-surface disabled:opacity-50"
+          >
+            {{ currentLang === 'km' ? 'បោះបង់' : 'Cancel' }}
+          </button>
+          <button
+            type="button"
+            :disabled="isDeleting"
+            @click="confirmDelete"
+            class="flex-1 py-3.5 bg-error text-white rounded-2xl font-black text-sm hover:opacity-90 disabled:opacity-50 transition-all"
+          >
+            {{ isDeleting
+              ? (currentLang === 'km' ? 'កំពុងលុប...' : 'Deleting...')
+              : (currentLang === 'km' ? 'លុប' : 'Delete') }}
+          </button>
+        </div>
+      </div>
+    </div>
+
     <!-- Category Manager Modal -->
     <div v-if="isCategoryModalOpen" class="fixed inset-0 z-[100] flex items-center justify-center p-4">
       <div class="absolute inset-0 bg-on-surface/40 backdrop-blur-sm" @click="isCategoryModalOpen = false"></div>
@@ -1600,7 +1811,7 @@ watch(currentLang, () => {
             <span class="material-symbols-outlined text-lg group-active:scale-90 transition-transform">block</span>
             Set Out of Stock
           </button>
-          <button @click="bulkDelete" class="flex items-center gap-2 text-error hover:opacity-80 transition-opacity text-xs font-black uppercase tracking-widest group">
+          <button @click="askBulkDelete" class="flex items-center gap-2 text-error hover:opacity-80 transition-opacity text-xs font-black uppercase tracking-widest group">
             <span class="material-symbols-outlined text-lg group-active:scale-90 transition-transform">delete</span>
             Delete Items
           </button>

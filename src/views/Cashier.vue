@@ -5,6 +5,7 @@ import { t, currentLang, setLang, translateDishName } from '../i18n'
 import { orderService } from '../services/orders'
 import { tableService } from '../services/tables'
 import { getSocket } from '../services/socket'
+import { invoiceService } from '../services/invoices'
 import { logout } from '../services/auth'
 
 const router = useRouter()
@@ -506,6 +507,75 @@ const onStorageUpdate = () => {
 }
 
 let syncTimer: any = null
+let openingPaidReceipt = false
+
+const mapInvoicePaymentMethod = (method?: string): SettleTransaction['paymentMethod'] => {
+  const m = String(method || '').toUpperCase()
+  if (m === 'CASH') return 'Cash'
+  if (m.includes('CARD')) return 'Credit Card'
+  return 'Mobile Pay'
+}
+
+const invoiceToReceipt = (invoice: any, payload: any): SettleTransaction => {
+  const invoiceItems = Array.isArray(invoice?.items) ? invoice.items : []
+  const items = invoiceItems.map((it: any) => ({
+    name: it.name || it.item_name || 'Item',
+    price: Number(it.unitPrice ?? it.price ?? it.unit_price ?? 0),
+    quantity: Number(it.quantity || 1),
+  }))
+  const subtotal = Number(
+    invoice?.subtotal ?? items.reduce((sum: number, it: any) => sum + it.price * it.quantity, 0),
+  )
+  const tax = Number(invoice?.tax ?? 0)
+  const total = Number(invoice?.totalAmount ?? invoice?.total ?? payload?.amount ?? 0) || 0
+  const tableNo = String(invoice?.tableNo || payload?.tableNumber || '')
+  return {
+    id: invoice?.invoiceNumber || payload?.transactionNumber || `PAY-${payload?.paymentId || ''}`,
+    timestamp: new Date(payload?.paidAt || invoice?.issuedAt || Date.now()).getTime(),
+    tableNo,
+    customerName: tableNo ? `Table ${tableNo} Guest` : 'Guest',
+    items,
+    subtotal,
+    tax,
+    serviceFee: 0,
+    total,
+    paymentMethod: mapInvoicePaymentMethod(invoice?.paymentMethod || payload?.paymentMethod),
+  }
+}
+
+const onPaymentPaid = async (payload: any) => {
+  if (!payload || String(payload.status).toUpperCase() !== 'PAID') return
+  if (openingPaidReceipt) return
+  openingPaidReceipt = true
+  try {
+    let invoice: any = null
+    const invoiceId = payload.invoiceId
+    if (invoiceId) {
+      try {
+        const res = await invoiceService.getInvoice(invoiceId)
+        invoice = res.data
+      } catch (invErr) {
+        console.log('Cashier invoice fetch notice:', invErr)
+      }
+    }
+    const receipt = invoiceToReceipt(invoice, payload)
+    viewingReceipt.value = receipt
+    showReceiptModal.value = true
+    if (!transactions.value.some((tx) => tx.id === receipt.id)) {
+      transactions.value.unshift(receipt)
+      saveTransactions()
+    }
+    if (receipt.tableNo) {
+      activeOrders.value = activeOrders.value.filter(
+        (o: any) => String(o.tableNo) !== String(receipt.tableNo),
+      )
+      saveData()
+    }
+    loadData()
+  } finally {
+    openingPaidReceipt = false
+  }
+}
 
 onMounted(() => {
   loadData()
@@ -522,6 +592,7 @@ onMounted(() => {
     socket.on('table.status.updated', () => {
       loadData()
     })
+    socket.on('payment.paid', onPaymentPaid)
   } catch (socketErr) {
     console.log('Socket listener notice in Cashier:', socketErr)
   }
@@ -533,6 +604,11 @@ onMounted(() => {
 onUnmounted(() => {
   window.removeEventListener('storage', onStorageUpdate)
   if (syncTimer) clearInterval(syncTimer)
+  try {
+    getSocket().off('payment.paid', onPaymentPaid)
+  } catch {
+    /* socket may already be down */
+  }
 })
 </script>
 

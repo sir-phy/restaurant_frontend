@@ -9,3 +9,11 @@ const DEFAULT_BACKEND_URL = 'http://localhost:4000';
 
 export const API_BASE_URL: string = envAccess?.VITE_API_BASE_URL || DEFAULT_BACKEND_URL;
 export const SOCKET_URL: string = envAccess?.VITE_SOCKET_URL || API_BASE_URL;
+
+/** Turn a stored menu image (relative /uploads/… or absolute URL) into a usable src. */
+export function resolveMediaUrl(url?: string | null): string {
+  if (!url) return ''
+  if (/^(https?:|data:|blob:)/i.test(url)) return url
+  const path = url.startsWith('/') ? url : `/${url}`
+  return `${API_BASE_URL}${path}`
+}

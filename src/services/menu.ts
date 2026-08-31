@@ -34,6 +34,19 @@ export interface MenuItemData {
   ingredients: MenuItemIngredientDef[]
 }
 
+export interface TopMenuItem {
+  id: number
+  rank: number
+  name: string
+  image?: string | null
+  price: number
+  status: string
+  category: string
+  soldCount: number
+  revenue: number
+  growthPercent: number | null
+}
+
 export interface UploadedImage {
   url: string
   filename: string
@@ -77,6 +90,8 @@ export const menuService = {
     }
     return api.get<MenuItemData[]>(`/menu-items${query}`)
   },
+  getTopItems: (limit = 10) =>
+    api.get<TopMenuItem[]>(`/menu-items/top?limit=${limit}`),
   getMenuItem: (id: number) => api.get<MenuItemData>(`/menu-items/${id}`),
   createMenuItem: (data: {
     category_id: number

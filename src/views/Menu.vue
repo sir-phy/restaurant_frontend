@@ -10,15 +10,18 @@ import {
   translateDishDesc, 
   translateIngredient 
 } from '../i18n'
-import { menuService } from '../services/menu.js'
+import { menuService, type TopMenuItem } from '../services/menu.js'
 import { orderService } from '../services/orders.js'
 import { paymentService, type KhqrCreateResult } from '../services/payments.js'
 import { invoiceService } from '../services/invoices.js'
 import { notificationService } from '../services/notifications.js'
+import { tableService } from '../services/tables.js'
 import { getSocket, joinTableRoom } from '../services/socket.js'
 import { login } from '../services/auth.js'
 import { getAccessToken } from '../services/api.js'
-import { API_BASE_URL } from '../services/config.js'
+import { API_BASE_URL, resolveMediaUrl } from '../services/config.js'
+import OffersBoard from '../components/OffersBoard.vue'
+import { promotionService, type Pairing, type Promotion } from '../services/offers.js'
 
 const route = useRoute()
 
@@ -190,6 +193,30 @@ const loadMenuItems = () => {
 }
 
 const menuItems = ref(loadMenuItems())
+const activePromos = ref<Promotion[]>([])
+
+const promoByMenuItemId = computed(() => {
+  const map: Record<number, Promotion> = {}
+  for (const promo of activePromos.value) {
+    if (String(promo.status || 'ACTIVE').toUpperCase() !== 'ACTIVE') continue
+    map[Number(promo.menuItemId)] = promo
+  }
+  return map
+})
+
+const getItemPromo = (item: { id?: number } | null | undefined) => {
+  if (item?.id == null) return undefined
+  return promoByMenuItemId.value[Number(item.id)]
+}
+
+const itemQty = (item: any) =>
+  item?.status === 'Available' ? getItemQuantity(item.id) : 1
+
+const itemDisplayPrice = (item: any) => {
+  const promo = getItemPromo(item)
+  const unit = promo ? Number(promo.promoPrice) : Number(item.price)
+  return unit * itemQty(item)
+}
 
 const searchQuery = ref('')
 
@@ -222,12 +249,41 @@ const filteredMenuItems = computed(() => {
   return items
 })
 
-const bestSellers = [
-  { name: 'Pepperoni Pizza', price: 18.99, sold: '1k', growth: '+15%', image: 'https://images.unsplash.com/photo-1628840042765-356cda07504e?auto=format&fit=crop&q=80&w=200' },
-  { name: 'Japanese Ramen', price: 15.00, sold: '1.2k', growth: '+20%', image: 'https://images.unsplash.com/photo-1557872245-741744bc7583?auto=format&fit=crop&q=80&w=200' },
-  { name: 'Fried Rice', price: 10.45, sold: '800', growth: '+12%', image: 'https://images.unsplash.com/photo-1512058564366-18510be2db19?auto=format&fit=crop&q=80&w=200' },
-  { name: 'Cheese Burger', price: 12.50, sold: '2.5k', growth: '+35%', image: 'https://lh3.googleusercontent.com/aida-public/AB6AXuC_58biya1paABTH6IL_cgl_57LeZ4J5ymsHNKEy_VgPxuOxJsNzXiFFL135exa1t8AFxAE6I2fw5HKu9sHfNi9f41xaGgw4NHdDHoFGJ3h0leJQEHhoHysmGLRxhQglZXOUTufuK9mHEbWp_8WFmSd3I687QvKMW_7--1nuVG5f9exmfqQTX38IjGOQI0saGNCydZ5B9nsRTYYoocZY18TGGQzVSVqgxv7r-xbwN3vB_Ia08uSSmBQQ3u1IkcUBkKEXrguPvWYPwE' }
-]
+const bestSellers = ref<TopMenuItem[]>([])
+
+const formatSoldCount = (n: number) => {
+  if (n >= 1000) {
+    const k = n / 1000
+    return `${Number.isInteger(k) ? k : k.toFixed(1).replace(/\.0$/, '')}k`
+  }
+  return String(n)
+}
+
+const orderTopItem = (item: TopMenuItem) => {
+  if (item.status !== 'AVAILABLE') return
+  const full = menuItems.value.find((m: any) => Number(m.id) === Number(item.id))
+  checkoutProductDirectly(full || {
+    id: item.id,
+    name: item.name,
+    price: Number(item.price),
+    image: resolveMediaUrl(item.image),
+    status: 'Available',
+    ingredients: [],
+  }, false)
+}
+
+const orderPromoItem = (promo: Promotion) => {
+  const full = menuItems.value.find((m: any) => Number(m.id) === Number(promo.menuItemId))
+  if (full && String(full.status) !== 'Available') return
+  checkoutProductDirectly(full || {
+    id: promo.menuItemId,
+    name: promo.name,
+    price: Number(promo.originalPrice),
+    image: resolveMediaUrl(promo.image),
+    status: 'Available',
+    ingredients: [],
+  }, false)
+}
 
 // Personalization Modal
 const isPersonalizeModalOpen = ref(false)
@@ -293,17 +349,58 @@ const adjustCustomerIngredient = (idx: number, isAddition: boolean) => {
 
 // Active Orders management & tracker
 const currentTable = ref(localStorage.getItem('gomeal_selected_table') || '12B')
+const tableNumericId = ref<number | null>(null)
 const guestName = ref(localStorage.getItem('gomeal_customer_name') || '')
 const allOrders = ref<any[]>([])
+
+const tableKey = (value: any) => String(value ?? '')
+const isCurrentTable = (tableNo: any) => tableKey(tableNo) === tableKey(currentTable.value)
+const settledStorageKey = () => `gomeal_settled_${tableKey(currentTable.value)}`
+const isTableSettled = () => sessionStorage.getItem(settledStorageKey()) === 'paid'
+const markTableSettled = () => sessionStorage.setItem(settledStorageKey(), 'paid')
+const clearTableSettled = () => sessionStorage.removeItem(settledStorageKey())
+
+/** Resolve restaurant_tables.id for this table number and join `table:{id}`. */
+const resolveAndJoinTableRoom = async () => {
+  try {
+    const asNum = Number(currentTable.value)
+    if (Number.isFinite(asNum) && asNum > 0 && String(asNum) === String(currentTable.value).trim()) {
+      tableNumericId.value = asNum
+    }
+    if (!tableNumericId.value) {
+      const tablesRes = await tableService.getTables({ search: String(currentTable.value), limit: 50 })
+      const list = Array.isArray(tablesRes.data) ? tablesRes.data : []
+      const match = list.find((t: any) =>
+        tableKey(t.table_number) === tableKey(currentTable.value) ||
+        tableKey(t.id) === tableKey(currentTable.value)
+      )
+      if (match?.id) tableNumericId.value = Number(match.id)
+    }
+  } catch (tableErr) {
+    console.log('Table id resolve notice:', tableErr)
+  }
+  const joinKey = tableNumericId.value ?? currentTable.value
+  try {
+    const joinRes = await joinTableRoom(joinKey)
+    if (joinRes?.ok && joinRes.tableId) {
+      tableNumericId.value = Number(joinRes.tableId)
+    }
+  } catch (joinErr) {
+    console.log('Table room join notice:', joinErr)
+  }
+}
 
 const loadOrders = () => {
   const stored = localStorage.getItem('gomeal_customer_orders')
   if (stored) {
     try {
-      allOrders.value = JSON.parse(stored).map((o: any) => ({
+      const parsed = JSON.parse(stored).map((o: any) => ({
         ...o,
         price: Number(o.price)
       }))
+      allOrders.value = isTableSettled()
+        ? parsed.filter((o: any) => !isCurrentTable(o.tableNo))
+        : parsed
       return
     } catch (e) {
       console.error(e)
@@ -333,12 +430,15 @@ const loadOrders = () => {
       timePlaced: '5 mins ago'
     }
   ]
-  localStorage.setItem('gomeal_customer_orders', JSON.stringify(defaultOrders))
-  allOrders.value = defaultOrders
+  const seeded = isTableSettled()
+    ? defaultOrders.filter((o) => !isCurrentTable(o.tableNo))
+    : defaultOrders
+  localStorage.setItem('gomeal_customer_orders', JSON.stringify(seeded))
+  allOrders.value = seeded
 }
 
 const myOrders = computed(() => {
-  return allOrders.value.filter((o: any) => o.tableNo === currentTable.value)
+  return allOrders.value.filter((o: any) => isCurrentTable(o.tableNo))
 })
 
 const activeDisplayOrders = computed(() => {
@@ -463,16 +563,19 @@ const stopPaymentPolling = () => {
 const startPaymentPolling = () => {
   stopPaymentPolling()
   // Nudges a backend Bakong verification every ~4s (server rate limit: 60/min).
+  // Keep polling even if the QR modal is closed — the receipt must still pop
+  // up the moment Bakong confirms the restaurant account received the money.
   paymentPollTimer = setInterval(pollPaymentStatus, 4000)
+  pollPaymentStatus()
 }
 
 const pollPaymentStatus = async () => {
-  // Stage guard: a stale tick after success/expiry must do nothing.
-  if (paymentStage.value !== 'pending' || !activePayment.value) return
+  if (isReceiptModalOpen.value) return
+  if (paymentStage.value === 'success') return
+  if (!activePayment.value) return
+  if (paymentStage.value !== 'pending' && paymentStage.value !== 'creating') return
   const paymentId = activePayment.value.paymentId
   try {
-    // Nudge the backend to verify against Bakong. Expected "not found yet"
-    // failures are ignored — the status call below is the source of truth.
     paymentService.verifyPayment(paymentId).catch(() => {})
 
     const res = await paymentService.getPaymentStatus(paymentId)
@@ -490,51 +593,109 @@ const pollPaymentStatus = async () => {
     } else if (status.status === 'CANCELLED') {
       stopPaymentPolling()
       paymentStage.value = 'expired'
+    } else {
+      paymentStage.value = 'pending'
     }
   } catch (pollErr) {
-    // Transient network error — keep polling.
     console.warn('Payment status poll retry:', pollErr)
   }
 }
 
-/** Mirrors backend truth into the local cart: the table session is settled. */
+/** After Bakong confirms PAID, My Order for this table must drop to 0. */
 const clearTableOrders = () => {
-  allOrders.value = allOrders.value.filter((o: any) => o.tableNo !== currentTable.value)
-  localStorage.setItem('gomeal_customer_orders', JSON.stringify(allOrders.value))
-  window.dispatchEvent(new Event('storage'))
+  allOrders.value = allOrders.value.filter((o: any) => !isCurrentTable(o.tableNo))
+  itemQuantities.value = {}
+  markTableSettled()
+  updateOrdersStorage()
+  isOrdersModalOpen.value = false
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+const fetchInvoiceWithRetry = async (statusData: any) => {
+  const paymentId = statusData.paymentId || activePayment.value?.paymentId
+  let invoiceId = statusData.invoiceId
+  let invoice: any = null
+  for (let attempt = 0; attempt < 5; attempt++) {
+    if (!invoiceId && paymentId) {
+      try {
+        const st = await paymentService.getPaymentStatus(paymentId)
+        invoiceId = st.data?.invoiceId
+      } catch {
+        /* keep retrying */
+      }
+    }
+    if (invoiceId) {
+      try {
+        const invRes = await invoiceService.getInvoice(invoiceId)
+        invoice = invRes.data
+        if (invoice) return invoice
+      } catch (invErr) {
+        console.warn('Invoice fetch retry:', invErr)
+      }
+    }
+    await sleep(350)
+  }
+  return invoice
+}
+
+const buildPaidReceipt = (statusData: any, invoice: any) => {
+  const invoiceItems = Array.isArray(invoice?.items) ? invoice.items : []
+  const items = invoiceItems.length
+    ? invoiceItems.map((it: any) => ({
+        name: it.name || it.item_name || 'Item',
+        quantity: Number(it.quantity || 1),
+        price: Number(it.unitPrice ?? it.price ?? it.unit_price ?? 0),
+      }))
+    : myOrders.value.map((o: any) => ({
+        name: o.name,
+        quantity: Number(o.quantity || 1),
+        price: Number(o.price || 0),
+      }))
+  const subtotal = Number(
+    invoice?.subtotal ?? items.reduce((sum: number, it: any) => sum + it.price * it.quantity, 0),
+  )
+  const tax = Number(invoice?.tax ?? 0)
+  const discount = Number(invoice?.discount ?? 0)
+  const total = Number(
+    invoice?.totalAmount ?? invoice?.total ?? statusData.amount ?? billingAmount.value ?? 0,
+  )
+  return {
+    id: invoice?.invoiceNumber || statusData.transactionHash || `PAY-${statusData.paymentId || ''}`,
+    invoice,
+    timestamp: statusData.paidAt || invoice?.issuedAt || Date.now(),
+    paymentMethod: invoice?.paymentMethod || 'KHQR / Bakong',
+    tableNo: invoice?.tableNo || currentTable.value,
+    items,
+    subtotal,
+    tax,
+    discount,
+    serviceFee: 0,
+    total,
+    currency: statusData.currency || invoice?.currency || 'USD',
+    transactionHash: statusData.transactionHash || activePayment.value?.transactionNumber || '',
+  }
 }
 
 /**
  * Builds the verified receipt ONLY from backend data (status + invoice) —
  * called exclusively when the backend reports PAID. Idempotent: the receipt
- * opens once even if several poll ticks land together.
+ * opens once even if several poll ticks or socket events land together.
  */
 const openVerifiedReceipt = async (statusData: any) => {
+  if (isReceiptModalOpen.value && paymentReceipt.value) return
   if (isOpeningReceipt) return
   isOpeningReceipt = true
   receiptLoading.value = true
   try {
-    let invoice: any = null
-    if (statusData.invoiceId) {
-      try {
-        const invRes = await invoiceService.getInvoice(statusData.invoiceId)
-        invoice = invRes.data
-      } catch (invErr) {
-        console.warn('Invoice fetch failed — receipt falls back to payment data:', invErr)
-      }
-    }
-    paymentReceipt.value = {
-      invoice,
-      transactionHash: statusData.transactionHash
-        || activePayment.value?.transactionNumber
-        || '',
-      paidAt: statusData.paidAt,
-      amount: statusData.amount ?? invoice?.totalAmount ?? 0,
-      currency: statusData.currency || invoice?.currency || 'USD',
-    }
+    const invoice = await fetchInvoiceWithRetry(statusData)
+    paymentReceipt.value = buildPaidReceipt(statusData, invoice)
     paymentStage.value = 'success'
     isPaymentQrModalOpen.value = false
     isAbaSimulatorOpen.value = false
+    isPayingSimulating.value = false
+    isPayingSucceed.value = false
+    isOrdersModalOpen.value = false
     isReceiptModalOpen.value = true
     sessionStorage.removeItem(paymentSessionKey.value)
     clearTableOrders()
@@ -558,6 +719,36 @@ const openVerifiedReceiptFromPaymentId = async (paymentId: number) => {
   return false
 }
 
+/** Resume watching a payment that was already started (page refresh / QR closed). */
+const resumePendingPaymentWatch = async () => {
+  const storedId = sessionStorage.getItem(paymentSessionKey.value)
+  if (!storedId) return
+  try {
+    const res = await paymentService.getPaymentStatus(storedId)
+    const status = res.data
+    if (status?.status === 'PAID') {
+      await openVerifiedReceipt(status)
+      return
+    }
+    if (status?.status === 'PENDING' || status?.status === 'PROCESSING') {
+      activePayment.value = {
+        paymentId: status.paymentId,
+        transactionNumber: status.transactionHash || storedId,
+        amount: status.amount,
+        currency: status.currency,
+        status: 'PENDING',
+        qrPayload: '',
+      } as KhqrCreateResult
+      paymentStage.value = 'pending'
+      startPaymentPolling()
+    } else {
+      sessionStorage.removeItem(paymentSessionKey.value)
+    }
+  } catch {
+    sessionStorage.removeItem(paymentSessionKey.value)
+  }
+}
+
 /**
  * Get-or-create the table's KHQR payment. The backend computes the amount and
  * returns the ORIGINAL pending payment on refresh/double-tap (idempotent) —
@@ -570,10 +761,12 @@ const createTableKhqrPayment = async () => {
   isPayingSimulating.value = false
   isPayingSucceed.value = false
   try {
-    const res = await paymentService.generateTableKHQR(currentTable.value)
+    const res = await paymentService.generateTableKHQR(tableNumericId.value ?? currentTable.value)
     const data = res.data
     if (!data) throw new Error('Empty payment response')
     activePayment.value = data
+    if (data.tableId) tableNumericId.value = Number(data.tableId)
+    await resolveAndJoinTableRoom()
     paymentSimulatedTxId.value = data.transactionNumber
     sessionStorage.setItem(paymentSessionKey.value, String(data.paymentId))
     if (data.status === 'PAID') {
@@ -632,10 +825,9 @@ const generateNewQr = async () => {
   await createTableKhqrPayment()
 }
 
-/** Close the Scan & Pay modal: stop polling but keep any pending payment so a
- *  reopen resumes it (idempotent create) instead of duplicating it. */
+/** Close the Scan & Pay modal. Keep polling in the background so the receipt
+ *  still pops up automatically once Bakong confirms the money arrived. */
 const closePaymentModal = () => {
-  stopPaymentPolling()
   isPaymentQrModalOpen.value = false
   isAbaSimulatorOpen.value = false
 }
@@ -652,11 +844,13 @@ const confirmSandboxSettle = async () => {
     await paymentService.sandboxSettlePayment(activePayment.value.paymentId)
     isPayingSimulating.value = false
     isPayingSucceed.value = true
-    playSuccessChime()
-    // The running poll flips the UI to the verified receipt automatically.
+    // Keep polling — the verified receipt pops up only after the backend
+    // reports PAID (Bakong money received + invoice created).
     if (!paymentPollTimer) {
       paymentStage.value = 'pending'
       startPaymentPolling()
+    } else {
+      pollPaymentStatus()
     }
   } catch (err: any) {
     isPayingSimulating.value = false
@@ -978,7 +1172,7 @@ const confirmPaymentRequest = () => {
   
   // Set all current table orders to Pending payment
   allOrders.value = allOrders.value.map((o: any) => {
-    if (o.tableNo === currentTable.value) {
+    if (isCurrentTable(o.tableNo)) {
       return { ...o, paymentStatus: 'Pending' }
     }
     return o
@@ -999,7 +1193,9 @@ const orderSuccessMessage = ref('')
 
 const checkoutProductDirectly = async (item: any, withCustomization: boolean = false) => {
   const qty = withCustomization ? personalizeQuantity.value : getItemQuantity(item.id)
-  const total = item.price * qty
+  const promo = getItemPromo(item)
+  const unitPrice = promo ? Number(promo.promoPrice) : Number(item.price)
+  const total = unitPrice * qty
   let details = ''
   let customStr = 'Standard Portions'
   let customizedDetails: any[] = []
@@ -1047,12 +1243,15 @@ const checkoutProductDirectly = async (item: any, withCustomization: boolean = f
       ]
     }
     await orderService.createOrder(orderPayload)
+    await resolveAndJoinTableRoom()
   } catch (apiErr) {
     console.log('Order API dispatch notice:', apiErr)
   }
 
+  clearTableSettled()
+
   // Try to find if the same item with same customizations is already ordered so we can consolidate
-  const existingIndex = allOrders.value.findIndex((o: any) => o.name === item.name && o.customizations === customStr && o.status === 'Preparing' && o.tableNo === currentTable.value)
+  const existingIndex = allOrders.value.findIndex((o: any) => o.name === item.name && o.customizations === customStr && o.status === 'Preparing' && isCurrentTable(o.tableNo))
   if (existingIndex > -1) {
     allOrders.value[existingIndex].quantity += qty
     allOrders.value[existingIndex].customerName = guestName.value.trim() || `Guest at Table ${currentTable.value}`
@@ -1061,7 +1260,7 @@ const checkoutProductDirectly = async (item: any, withCustomization: boolean = f
     allOrders.value.push({
       id: Date.now() + Math.floor(Math.random() * 1000),
       name: item.name,
-      price: Number(item.price),
+      price: unitPrice,
       quantity: qty,
       image: item.image || 'https://images.unsplash.com/photo-1546069901-ba9599a7e63c?auto=format&fit=crop&q=80&w=400',
       status: 'Preparing',
@@ -1094,15 +1293,7 @@ const checkoutProductDirectly = async (item: any, withCustomization: boolean = f
   }, 5000)
 }
 
-const checkoutComboDirectly = async () => {
-  const comboItem = {
-    id: 999123,
-    name: 'Classic Burger + Fried Rice',
-    price: 9.99,
-    image: 'https://images.unsplash.com/photo-1568901346375-23c9450c58cd?auto=format&fit=crop&q=80&w=200',
-    status: 'Available'
-  }
-  
+const checkoutComboDirectly = async (pairing: Pairing) => {
   const qty = 1
 
   try {
@@ -1110,40 +1301,49 @@ const checkoutComboDirectly = async () => {
       tableId: currentTable.value,
       items: [
         {
-          menuItemId: 1,
+          menuItemId: pairing.left.id,
           quantity: qty,
-          customizationNote: 'Standard Combo Deal'
-        }
-      ]
+          customizationNote: `Combo: ${pairing.name}`,
+        },
+        {
+          menuItemId: pairing.right.id,
+          quantity: qty,
+          customizationNote: `Combo: ${pairing.name}`,
+        },
+      ],
     })
+    await resolveAndJoinTableRoom()
   } catch (apiErr) {
     console.log('Combo API notice:', apiErr)
   }
-  
+
+  clearTableSettled()
+
   allOrders.value.push({
     id: Date.now() + Math.floor(Math.random() * 1000),
-    name: comboItem.name,
-    price: comboItem.price,
+    name: pairing.name,
+    price: Number(pairing.comboPrice),
     quantity: qty,
-    image: comboItem.image,
+    image: pairing.left.image,
     status: 'Preparing',
-    customizations: 'Standard Combo Deal',
+    customizations: pairing.description || 'Standard Combo Deal',
     customizedDetails: [],
     tableNo: currentTable.value,
     customerName: guestName.value.trim() || `Guest at Table ${currentTable.value}`,
     paymentStatus: 'Unpaid',
     timePlaced: 'Just now'
   })
-  
+
   updateOrdersStorage()
-  
+
+  const price = Number(pairing.comboPrice).toFixed(2)
   if (currentLang.value === 'km') {
-    orderSuccessMessage.value = `បានកុម្ម៉ង់ឈុត ប៊ឺហ្គឺរ + បាយឆាគ្រឿងសមុទ្រ ចំនួន x1 ($9.99) ដោយជោគជ័យ! បញ្ចូលទៅក្នុងបញ្ជីចម្អិនរបស់តុរួចរាល់។`
+    orderSuccessMessage.value = `បានកុម្ម៉ង់ឈុត ${pairing.name} ចំនួន x1 ($${price}) ដោយជោគជ័យ!`
   } else {
-    orderSuccessMessage.value = `Successfully ordered x1 Classic Burger + Fried Rice Combo ($9.99)! Added to table order list.`
+    orderSuccessMessage.value = `Successfully ordered x1 ${pairing.name} ($${price})! Added to table order list.`
   }
   isOrderSuccessToastVisible.value = true
-  
+
   setTimeout(() => {
     isOrderSuccessToastVisible.value = false
   }, 5000)
@@ -1240,6 +1440,13 @@ const refreshMenuFromBackend = async () => {
       categories.value = cats
     }
 
+    try {
+      const promoRes = await promotionService.list('ACTIVE')
+      activePromos.value = Array.isArray(promoRes.data) ? promoRes.data : []
+    } catch {
+      activePromos.value = []
+    }
+
     const itemsRes = await menuService.getMenuItems()
     if (itemsRes.data && Array.isArray(itemsRes.data) && itemsRes.data.length > 0) {
       menuItems.value = itemsRes.data.map((i: any) => {
@@ -1258,10 +1465,13 @@ const refreshMenuFromBackend = async () => {
             unit: ing.unit
           })),
           status,
-          image: i.image
+          image: resolveMediaUrl(i.image)
         }
       })
     }
+
+    const topRes = await menuService.getTopItems(10)
+    bestSellers.value = Array.isArray(topRes.data) ? topRes.data : []
   } catch (loadErr) {
     console.log('Backend menu data load notice:', loadErr)
   }
@@ -1289,8 +1499,24 @@ onMounted(async () => {
 
   // Real-Time Socket.IO connection and Table Room
   try {
-    joinTableRoom(currentTable.value)
+    await resolveAndJoinTableRoom()
     const socket = getSocket()
+    const onPaymentPaid = (payload: any) => {
+      const pid = Number(payload?.paymentId || payload?.id)
+      if (!pid) return
+      const payloadTableId = Number(payload?.tableId)
+      const payloadTableNumber = payload?.tableNumber != null ? String(payload.tableNumber) : ''
+      const matchesActive =
+        !!activePayment.value && Number(activePayment.value.paymentId) === pid
+      const matchesTableId =
+        !!tableNumericId.value &&
+        Number.isFinite(payloadTableId) &&
+        payloadTableId === tableNumericId.value
+      const matchesTableNumber =
+        !!payloadTableNumber && tableKey(payloadTableNumber) === tableKey(currentTable.value)
+      if (!matchesActive && !matchesTableId && !matchesTableNumber) return
+      openVerifiedReceiptFromPaymentId(pid)
+    }
     socket.on('notification.created', (notif: any) => {
       if (notif.tableId === currentTable.value || !notif.tableId) {
         delayMessage.value = notif.message
@@ -1305,9 +1531,12 @@ onMounted(async () => {
     socket.on('order.status.updated', () => {
       syncMenuData()
     })
+    socket.on('payment.paid', onPaymentPaid)
   } catch (socketErr) {
     console.log('Socket listener notice:', socketErr)
   }
+
+  await resumePendingPaymentWatch()
 
   // Poll backend so menu items added in Menu Management appear without reload.
   const interval = setInterval(() => {
@@ -1317,6 +1546,11 @@ onMounted(async () => {
   onUnmounted(() => {
     clearInterval(interval)
     stopPaymentPolling()
+    try {
+      getSocket().off('payment.paid')
+    } catch {
+      /* socket may already be down */
+    }
     window.removeEventListener('storage', syncMenuData)
   })
 })
@@ -1486,6 +1720,8 @@ onMounted(async () => {
         </div>
       </section>
 
+      <OffersBoard @add-pair="checkoutComboDirectly" @order-promo="orderPromoItem" />
+
       <!-- Popular Products -->
       <section>
         <div class="flex items-center justify-between mb-6">
@@ -1498,11 +1734,17 @@ onMounted(async () => {
             :key="prod.id"
             class="bg-white p-5 rounded-3xl shadow-sm hover:shadow-xl border transition-all duration-300 group flex flex-col relative"
             :class="[
-              prod.status === 'Sold Out' ? 'opacity-75 grayscale-[0.1] border-outline-variant/40' : 'border-surface-variant hover:border-primary-container'
+              prod.status === 'Sold Out' ? 'opacity-75 grayscale-[0.1] border-outline-variant/40' : getItemPromo(prod) ? 'border-secondary/40 hover:border-secondary' : 'border-surface-variant hover:border-primary-container'
             ]"
           >
             <div class="relative overflow-hidden rounded-2xl mb-4 h-44 bg-surface-container-lowest">
               <img :src="prod.image || 'https://images.unsplash.com/photo-1546069901-ba9599a7e63c?auto=format&fit=crop&q=80&w=400'" :alt="prod.name" class="w-full h-full object-cover group-hover:scale-110 transition-transform duration-700" />
+              <span
+                v-if="getItemPromo(prod)"
+                class="absolute top-0 left-0 z-10 bg-secondary text-white px-2.5 py-1 rounded-br-xl text-[9px] font-black uppercase tracking-widest shadow-sm"
+              >
+                {{ currentLang === 'km' ? 'ប្រម៉ូ ' : '' }}{{ Number(getItemPromo(prod)?.discountPercent) }}% Off
+              </span>
               <button class="absolute top-3 right-3 p-2 bg-white/80 backdrop-blur-md rounded-full text-on-surface-variant hover:text-secondary transition-colors shadow-sm">
                 <span class="material-symbols-outlined text-[20px]">favorite</span>
               </button>
@@ -1513,6 +1755,10 @@ onMounted(async () => {
                 >
                   {{ prod.status === 'Available' ? t('available') : t('soldOut') }}
                 </span>
+                <span
+                  v-if="getItemPromo(prod)"
+                  class="bg-secondary text-white px-2.5 py-1 rounded-xl text-[9px] font-black uppercase tracking-widest shadow-sm"
+                >{{ currentLang === 'km' ? 'ប្រម៉ូសិន' : 'Promo' }}</span>
                 <span v-if="prod.lowStock" class="bg-secondary text-white px-2.5 py-1 rounded-xl text-[9px] font-black uppercase tracking-widest shadow-sm">{{ currentLang === 'km' ? 'គ្រឿងផ្សំតិច' : 'Low Stock' }}</span>
               </div>
             </div>
@@ -1526,8 +1772,12 @@ onMounted(async () => {
                 </div>
               </div>
               <div class="text-right flex flex-col shrink-0">
-                <span class="text-primary font-black text-lg">${{ (prod.price * (prod.status === 'Available' ? getItemQuantity(prod.id) : 1)).toFixed(2) }}</span>
-                <span v-if="prod.status === 'Available' && getItemQuantity(prod.id) > 1" class="text-[9px] text-outline font-black">${{ prod.price.toFixed(2) }} {{ currentLang === 'km' ? 'ក្នុងមួយឯកតា' : 'each' }}</span>
+                <span class="text-primary font-black text-lg">${{ itemDisplayPrice(prod).toFixed(2) }}</span>
+                <span
+                  v-if="getItemPromo(prod)"
+                  class="text-[10px] text-outline font-bold line-through"
+                >${{ (Number(prod.price) * itemQty(prod)).toFixed(2) }}</span>
+                <span v-else-if="prod.status === 'Available' && getItemQuantity(prod.id) > 1" class="text-[9px] text-outline font-black">${{ prod.price.toFixed(2) }} {{ currentLang === 'km' ? 'ក្នុងមួយឯកតា' : 'each' }}</span>
               </div>
             </div>
 
@@ -1612,94 +1862,51 @@ onMounted(async () => {
         </div>
       </section>
 
-      <!-- Best Sellers -->
+      <!-- Top 10 -->
       <section>
         <div class="flex items-center justify-between mb-6">
-          <h3 class="text-xl font-black text-on-surface">{{ currentLang === 'km' ? 'មុខម្ហូបលក់ដាច់បំផុត' : 'Best Seller' }}</h3>
-          <button class="text-primary text-xs font-bold flex items-center">{{ currentLang === 'km' ? 'មើលទាំងអស់' : 'View all' }} <span class="material-symbols-outlined text-[16px]">chevron_right</span></button>
+          <h3 class="text-xl font-black text-on-surface">{{ currentLang === 'km' ? 'ម្ហូប Top 10' : 'Top 10' }}</h3>
+          <span class="text-xs font-bold text-on-surface-variant bg-surface-container px-3 py-1 rounded-full">
+            {{ currentLang === 'km' ? 'លក់ដាច់បំផុតពីការកុម្ម៉ង់' : 'Most ordered by customers' }}
+          </span>
         </div>
-        <div class="flex gap-4 overflow-x-auto pb-6 no-scrollbar snap-x">
-          <div 
-            v-for="item in bestSellers" 
-            :key="item.name"
+        <div v-if="bestSellers.length === 0" class="bg-white rounded-3xl border border-dashed border-outline-variant px-6 py-10 text-center">
+          <p class="text-sm font-black text-on-surface-variant">{{ currentLang === 'km' ? 'មិនទាន់មានចំណាត់ថ្នាក់លក់' : 'No top dishes yet' }}</p>
+          <p class="text-xs text-outline font-bold mt-1">{{ currentLang === 'km' ? 'មុខម្ហូបនឹងចូល Top 10 ពេលអតិថិជនកុម្ម៉ង់ច្រើន។' : 'Dishes climb this list as customers order them.' }}</p>
+        </div>
+        <div v-else class="flex gap-4 overflow-x-auto pb-6 no-scrollbar snap-x">
+          <button
+            v-for="item in bestSellers"
+            :key="item.id"
+            type="button"
             class="min-w-[170px] bg-white rounded-3xl p-5 shadow-sm snap-start text-center border border-surface-variant hover:border-primary-container transition-all group"
+            :class="item.status === 'AVAILABLE' ? 'cursor-pointer' : 'opacity-70 cursor-not-allowed'"
+            @click="orderTopItem(item)"
           >
-            <div class="w-24 h-24 mx-auto mb-4 rounded-full overflow-hidden p-1 border-2 border-surface-container group-hover:border-primary-container transition-colors">
-              <img :src="item.image" :alt="item.name" class="w-full h-full object-cover rounded-full" />
+            <div class="relative w-24 h-24 mx-auto mb-4">
+              <span
+                class="absolute -top-1 -left-1 z-10 w-7 h-7 rounded-full flex items-center justify-center text-[10px] font-black shadow-sm"
+                :class="item.rank === 1 ? 'bg-primary text-white' : item.rank === 2 ? 'bg-on-surface-variant text-white' : item.rank === 3 ? 'bg-secondary text-white' : 'bg-surface-container text-on-surface'"
+              >{{ item.rank }}</span>
+              <span
+                v-if="getItemPromo(item)"
+                class="absolute -bottom-1 left-1/2 -translate-x-1/2 z-10 bg-secondary text-white px-1.5 py-0.5 rounded-full text-[8px] font-black uppercase tracking-widest whitespace-nowrap shadow-sm"
+              >{{ Number(getItemPromo(item)?.discountPercent) }}% Off</span>
+              <div class="w-24 h-24 rounded-full overflow-hidden p-1 border-2 border-surface-container group-hover:border-primary-container transition-colors">
+                <img :src="resolveMediaUrl(item.image)" :alt="item.name" class="w-full h-full object-cover rounded-full" />
+              </div>
             </div>
             <h5 class="font-black text-sm mb-1 line-clamp-1">{{ translateDishName(item.name) }}</h5>
-            <p class="text-primary font-black text-sm mb-4">${{ item.price.toFixed(2) }}</p>
+            <p class="text-primary font-black text-sm" :class="getItemPromo(item) ? '' : 'mb-4'">
+              ${{ Number(getItemPromo(item)?.promoPrice ?? item.price).toFixed(2) }}
+            </p>
+            <p v-if="getItemPromo(item)" class="text-[10px] text-outline font-bold line-through mb-3">${{ Number(item.price).toFixed(2) }}</p>
             <div class="flex items-center justify-center gap-1 text-tertiary font-bold text-[10px] bg-tertiary/10 py-1.5 rounded-full px-3">
-              <span>{{ currentLang === 'km' ? 'លក់បាន ' : 'Sold ' }}{{ item.sold }}</span>
+              <span>{{ currentLang === 'km' ? 'លក់បាន ' : 'Sold ' }}{{ formatSoldCount(item.soldCount) }}</span>
               <span class="material-symbols-outlined text-[14px]">trending_up</span>
-              <span>{{ item.growth }}</span>
+              <span v-if="item.growthPercent != null">{{ item.growthPercent > 0 ? '+' : '' }}{{ item.growthPercent }}%</span>
             </div>
-          </div>
-        </div>
-      </section>
-
-      <!-- Promo Section -->
-      <section>
-        <div class="flex items-center justify-between mb-6">
-          <h3 class="text-xl font-black text-on-surface">{{ currentLang === 'km' ? 'ប្រម៉ូសិនពិសេស' : 'Promo' }}</h3>
-          <button class="text-primary text-xs font-bold flex items-center">{{ currentLang === 'km' ? 'មើលទាំងអស់' : 'View all' }} <span class="material-symbols-outlined text-[16px]">chevron_right</span></button>
-        </div>
-        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-          <div v-for="i in 4" :key="i" class="bg-white p-4 rounded-3xl shadow-sm border border-surface-variant flex gap-4 items-center group hover:border-primary-container transition-all">
-            <div class="relative w-24 h-24 shrink-0 overflow-hidden rounded-2xl bg-surface-container">
-              <span class="absolute top-0 left-0 bg-secondary text-white px-2 py-0.5 rounded-br-lg text-[10px] font-black z-10">{{ currentLang === 'km' ? 'ចុះសល់ ' : '' }}15% Off</span>
-              <img class="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500" src="https://images.unsplash.com/photo-1550547660-d9450f859349?auto=format&fit=crop&q=80&w=400" />
-            </div>
-            <div class="flex flex-col gap-1">
-              <h6 class="font-black text-sm line-clamp-1">{{ translateDishName('Cheese Burger') }}</h6>
-              <div class="flex items-center gap-2">
-                <span class="text-primary font-black">$3.59</span>
-                <span class="text-on-surface-variant/50 text-[10px] line-through">$5.59</span>
-              </div>
-              <div class="flex items-center gap-1 text-primary-container">
-                <span class="material-symbols-outlined text-[12px]" style="font-variation-settings: 'FILL' 1">star</span>
-                <span class="text-on-surface-variant text-[10px] font-bold">5.0 <span class="opacity-50">({{ currentLang === 'km' ? 'ការវាយតម្លៃ ១ពាន់+' : '1k+ Reviews' }})</span></span>
-              </div>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <!-- Popular Pairings -->
-      <section>
-        <div class="flex items-center justify-between mb-6">
-          <h3 class="text-xl font-black text-on-surface">{{ currentLang === 'km' ? 'ឈុតចាប់គូពេញនិយម' : 'Popular Pairings' }}</h3>
-          <button class="text-primary text-xs font-bold flex items-center">{{ currentLang === 'km' ? 'មើលទាំងអស់' : 'View all' }} <span class="material-symbols-outlined text-[16px]">chevron_right</span></button>
-        </div>
-        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          <div v-for="i in 3" :key="i" class="bg-white p-6 rounded-3xl shadow-sm hover:shadow-md transition-all border border-surface-variant flex flex-col group">
-            <div class="flex items-center justify-center gap-2 mb-6">
-              <div class="w-24 h-24 rounded-full overflow-hidden border-2 border-surface-container-low group-hover:border-primary-container transition-colors">
-                <img class="w-full h-full object-cover" src="https://images.unsplash.com/photo-1568901346375-23c9450c58cd?auto=format&fit=crop&q=80&w=200" />
-              </div>
-              <span class="material-symbols-outlined text-outline">add</span>
-              <div class="w-24 h-24 rounded-full overflow-hidden border-2 border-surface-container-low group-hover:border-primary-container transition-colors">
-                <img class="w-full h-full object-cover" src="https://images.unsplash.com/photo-1512058564366-18510be2db19?auto=format&fit=crop&q=80&w=200" />
-              </div>
-            </div>
-            <div class="text-center mb-6">
-              <h4 class="text-lg font-black text-on-surface">{{ currentLang === 'km' ? 'ឈុតប៊ឺហ្គឺរ + បាយឆាគ្រឿងសមុទ្រ' : 'Classic Burger + Fried Rice' }}</h4>
-              <div v-if="i === 1" class="mt-1 bg-tertiary/10 text-tertiary text-[10px] inline-block px-2 py-0.5 rounded-full font-black">{{ currentLang === 'km' ? 'លក់ដាច់បំផុត' : 'Most Popular' }}</div>
-              <p class="text-on-surface-variant text-xs mt-1">{{ currentLang === 'km' ? 'ឈុតអាហារសម្រន់ឆ្ងាញ់ពិសាសម្រាប់ញ៉ាំគ្នាពីរនាក់' : 'The ultimate hunger-crusher combo for two.' }}</p>
-            </div>
-            <div class="mt-auto flex items-center justify-between border-t border-surface-variant pt-4">
-              <div class="flex flex-col">
-                <span class="text-secondary font-black text-xs uppercase tracking-tighter">{{ currentLang === 'km' ? 'តម្លៃឈុតរួមគ្នា' : 'Combo Price' }}</span>
-                <span class="text-primary font-black text-xl">$9.99</span>
-              </div>
-              <button 
-                @click="checkoutComboDirectly"
-                class="bg-primary text-white px-6 py-2.5 rounded-full font-black text-xs hover:opacity-90 active:scale-95 transition-all"
-              >
-                {{ currentLang === 'km' ? 'កុម្ម៉ង់ឈុតនេះ' : 'Add Pair' }}
-              </button>
-            </div>
-          </div>
+          </button>
         </div>
       </section>
     </main>
@@ -1727,7 +1934,12 @@ onMounted(async () => {
             <div>
               <span class="text-[10px] font-black uppercase text-primary tracking-widest bg-primary/10 px-2.5 py-1 rounded-full">{{ currentLang === 'km' ? 'កែសម្រួលគ្រឿងផ្សំពិសេស' : 'Custom Personalizer' }}</span>
               <h3 class="text-xl font-black text-on-surface mt-1">{{ translateDishName(personalizingItem.name) }}</h3>
-              <p class="text-xs text-on-surface-variant font-bold mt-0.5">${{ personalizingItem.price.toFixed(2) }} ({{ currentLang === 'km' ? 'តម្លៃដើម' : 'base price' }})</p>
+              <p v-if="getItemPromo(personalizingItem)" class="text-xs font-bold mt-0.5">
+                <span class="text-secondary uppercase tracking-widest text-[10px] font-black">{{ currentLang === 'km' ? 'ប្រម៉ូសិន' : 'Promo' }} {{ Number(getItemPromo(personalizingItem)?.discountPercent) }}% Off</span>
+                <span class="text-primary font-black ml-1">${{ Number(getItemPromo(personalizingItem)?.promoPrice).toFixed(2) }}</span>
+                <span class="text-outline line-through ml-1">${{ personalizingItem.price.toFixed(2) }}</span>
+              </p>
+              <p v-else class="text-xs text-on-surface-variant font-bold mt-0.5">${{ personalizingItem.price.toFixed(2) }} ({{ currentLang === 'km' ? 'តម្លៃដើម' : 'base price' }})</p>
             </div>
           </div>
           <button 
@@ -2386,7 +2598,7 @@ onMounted(async () => {
         <!-- Sticky Footer actions -->
         <div class="p-4 sm:p-5 bg-white border-t border-surface-variant/40 flex shrink-0">
           <button 
-            @click="isPaymentQrModalOpen = false"
+            @click="closePaymentModal"
             class="w-full bg-white border border-outline hover:bg-slate-50 text-slate-700 py-2.5 sm:py-3 rounded-xl font-black text-xs transition-all flex items-center justify-center outline-none cursor-pointer"
           >
             {{ currentLang === 'km' ? 'ត្រឡប់ក្រោយ' : 'Go Back' }}
@@ -2395,10 +2607,20 @@ onMounted(async () => {
       </div>
     </div>
 
+    <!-- CONFIRMING PAYMENT OVERLAY -->
+    <div
+      v-if="receiptLoading && !isReceiptModalOpen"
+      class="fixed inset-0 bg-black/70 backdrop-blur-md z-[60] flex items-center justify-center p-4"
+    >
+      <div class="bg-white rounded-3xl px-8 py-10 text-center shadow-2xl max-w-sm w-full">
+        <span class="material-symbols-outlined text-emerald-600 text-5xl animate-spin">autorenew</span>
+        <h3 class="text-lg font-black text-on-surface mt-4">{{ currentLang === 'km' ? 'កំពុងបញ្ជាក់ការទូទាត់…' : 'Confirming payment…' }}</h3>
+        <p class="text-xs text-on-surface-variant font-bold mt-2">{{ currentLang === 'km' ? 'Bakong បានទទួលប្រាក់ហើយ។ កំពុងបើកវិក្កយបត្រ។' : 'Bakong received the money. Opening your receipt.' }}</p>
+      </div>
+    </div>
+
     <!-- PAYMENT VERIFIED RECEIPT POPUP -->
-    <!-- Pops up automatically once a settlement succeeds: tangible proof that
-         the customer has paid for the food (ref, itemized lines, totals). It
-         stays on screen until the customer explicitly dismisses it. -->
+    <!-- Pops up automatically once Bakong confirms the restaurant received the money. -->
     <div 
       v-if="isReceiptModalOpen && paymentReceipt"
       class="fixed inset-0 bg-black/70 backdrop-blur-md z-[60] flex items-center justify-center p-4 animate-in fade-in duration-300 pointer-events-auto"
@@ -2407,7 +2629,7 @@ onMounted(async () => {
         <!-- Verified Head -->
         <div class="relative bg-emerald-50 p-5 border-b border-emerald-100 text-center shrink-0">
           <button 
-            @click="isReceiptModalOpen = false"
+            @click="finishReceipt"
             class="absolute top-3 right-3 p-1.5 bg-white rounded-full hover:bg-surface-container text-outline hover:text-on-surface transition-all shadow-sm outline-none border-none cursor-pointer"
           >
             <span class="material-symbols-outlined text-base">close</span>
@@ -2416,7 +2638,7 @@ onMounted(async () => {
             <span class="material-symbols-outlined text-3xl font-black">verified</span>
           </div>
           <h3 class="text-base sm:text-lg font-black text-emerald-700">{{ currentLang === 'km' ? 'ការទូទាត់ប្រាក់បានបញ្ជាក់រួចរាល់' : 'Payment Verified' }}</h3>
-          <p class="text-[10px] sm:text-[11px] text-emerald-600/90 font-bold uppercase tracking-wider mt-0.5">{{ currentLang === 'km' ? 'អតិថិជនបានបង់ប្រាក់សម្រាប់មុខម្ហូបរួចរាល់' : 'Customer has paid for the food' }}</p>
+          <p class="text-[10px] sm:text-[11px] text-emerald-600/90 font-bold uppercase tracking-wider mt-0.5">{{ currentLang === 'km' ? 'គណនី Bakong បានទទួលប្រាក់ — អតិថិជនបានបង់រួច' : 'Bakong received the money — food is paid' }}</p>
           <span class="inline-flex items-center gap-1 mt-2.5 bg-emerald-600 text-white text-[9px] font-black uppercase tracking-widest px-2.5 py-1 rounded-full shadow-sm">
             <span class="material-symbols-outlined text-[11px]">task_alt</span>
             {{ currentLang === 'km' ? 'បានបង់ប្រាក់' : 'PAID' }}
@@ -2427,9 +2649,13 @@ onMounted(async () => {
         <div class="flex-1 overflow-y-auto min-h-0 p-5 space-y-4 custom-scrollbar">
           <!-- Meta -->
           <div class="space-y-2 text-xs font-semibold text-slate-600">
-            <div class="flex justify-between">
-              <span>{{ currentLang === 'km' ? 'លេខប្រតិបត្តិការ៖' : 'Transaction Ref:' }}</span>
-              <span class="font-black font-mono text-[11px] text-slate-950">{{ paymentReceipt.id }}</span>
+            <div class="flex justify-between gap-3">
+              <span>{{ currentLang === 'km' ? 'លេខវិក្កយបត្រ៖' : 'Receipt No:' }}</span>
+              <span class="font-black font-mono text-[11px] text-slate-950 text-right break-all">{{ paymentReceipt.id }}</span>
+            </div>
+            <div v-if="paymentReceipt.transactionHash" class="flex justify-between gap-3">
+              <span>{{ currentLang === 'km' ? 'Bakong Hash៖' : 'Bakong Ref:' }}</span>
+              <span class="font-black font-mono text-[10px] text-slate-950 text-right break-all">{{ paymentReceipt.transactionHash }}</span>
             </div>
             <div class="flex justify-between">
               <span>{{ currentLang === 'km' ? 'កាលបរិច្ឆេទបានបង់៖' : 'Paid At:' }}</span>
@@ -2446,10 +2672,10 @@ onMounted(async () => {
           </div>
 
           <!-- Itemized Lines -->
-          <div class="space-y-1.5 max-h-36 overflow-y-auto custom-scrollbar pr-0.5">
-            <div v-for="(item, idx) in paymentReceipt.items" :key="item.name + '-' + idx" class="flex justify-between text-xs text-slate-800">
+          <div v-if="paymentReceipt.items?.length" class="space-y-1.5 max-h-36 overflow-y-auto custom-scrollbar pr-0.5">
+            <div v-for="(item, idx) in paymentReceipt.items" :key="(item.name || 'item') + '-' + idx" class="flex justify-between text-xs text-slate-800">
               <span class="truncate font-semibold">{{ translateDishName(item.name) }} <em class="text-slate-400 font-bold not-italic">×{{ item.quantity }}</em></span>
-              <span class="font-black text-slate-900">${{ (item.price * item.quantity).toFixed(2) }}</span>
+              <span class="font-black text-slate-900">${{ (Number(item.price) * Number(item.quantity)).toFixed(2) }}</span>
             </div>
           </div>
 
@@ -2457,19 +2683,23 @@ onMounted(async () => {
           <div class="border-t-2 border-dashed border-slate-200 pt-3 space-y-1.5 text-xs font-semibold text-slate-600">
             <div class="flex justify-between">
               <span>{{ currentLang === 'km' ? 'តម្លៃសរុបដើម៖' : 'Subtotal :' }}</span>
-              <span class="text-slate-950">${{ paymentReceipt.subtotal.toFixed(2) }}</span>
+              <span class="text-slate-950">${{ Number(paymentReceipt.subtotal || 0).toFixed(2) }}</span>
             </div>
             <div class="flex justify-between">
               <span>{{ currentLang === 'km' ? 'ពន្ធអាករ (10%)៖' : 'VAT (10%) :' }}</span>
-              <span class="text-slate-950">${{ paymentReceipt.tax.toFixed(2) }}</span>
+              <span class="text-slate-950">${{ Number(paymentReceipt.tax || 0).toFixed(2) }}</span>
             </div>
-            <div class="flex justify-between">
+            <div v-if="Number(paymentReceipt.discount) > 0" class="flex justify-between">
+              <span>{{ currentLang === 'km' ? 'បញ្ចុះតម្លៃ៖' : 'Discount :' }}</span>
+              <span class="text-slate-950">-${{ Number(paymentReceipt.discount).toFixed(2) }}</span>
+            </div>
+            <div v-if="Number(paymentReceipt.serviceFee) > 0" class="flex justify-between">
               <span>{{ currentLang === 'km' ? 'សេវាកម្ម (5%)៖' : 'Service Fee (5%) :' }}</span>
-              <span class="text-slate-950">${{ paymentReceipt.serviceFee.toFixed(2) }}</span>
+              <span class="text-slate-950">${{ Number(paymentReceipt.serviceFee).toFixed(2) }}</span>
             </div>
             <div class="flex justify-between text-sm pt-2 border-t-2 border-dashed border-slate-200">
               <span class="font-black text-slate-950">{{ currentLang === 'km' ? 'ប្រាក់បានបង់៖' : 'Amount Paid:' }}</span>
-              <span class="font-black text-emerald-600 font-display">${{ paymentReceipt.total.toFixed(2) }}</span>
+              <span class="font-black text-emerald-600 font-display">${{ Number(paymentReceipt.total || 0).toFixed(2) }} {{ paymentReceipt.currency }}</span>
             </div>
           </div>
         </div>
@@ -2479,13 +2709,25 @@ onMounted(async () => {
           <p class="text-[10px] text-slate-500 font-bold text-center leading-relaxed px-2">
             {{ currentLang === 'km' ? 'សូមរក្សាទុកវិក្កយបត្រនេះជាភស្តុតាងនៃការទូទាត់ប្រាក់។ អរគុណសម្រាប់ការពិសាអាហារ!' : 'Keep this receipt as proof of payment. Thank you for dining with us!' }}
           </p>
-          <button 
-            @click="isReceiptModalOpen = false"
-            class="w-full bg-emerald-600 hover:bg-emerald-700 text-white py-2.5 sm:py-3 rounded-xl font-black text-xs uppercase tracking-wider transition-all flex items-center justify-center gap-2 outline-none border-none cursor-pointer active:scale-95"
-          >
-            <span class="material-symbols-outlined text-sm">check_circle</span>
-            {{ currentLang === 'km' ? 'រួចរាល់' : 'Done' }}
-          </button>
+          <div class="flex gap-2">
+            <button 
+              v-if="paymentReceipt.invoice?.id"
+              type="button"
+              @click="viewReceiptPdf"
+              class="flex-1 bg-white border-2 border-emerald-600 text-emerald-700 py-2.5 sm:py-3 rounded-xl font-black text-xs uppercase tracking-wider transition-all flex items-center justify-center gap-2 outline-none cursor-pointer active:scale-95"
+            >
+              <span class="material-symbols-outlined text-sm">picture_as_pdf</span>
+              {{ currentLang === 'km' ? 'PDF' : 'PDF' }}
+            </button>
+            <button 
+              type="button"
+              @click="finishReceipt"
+              class="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white py-2.5 sm:py-3 rounded-xl font-black text-xs uppercase tracking-wider transition-all flex items-center justify-center gap-2 outline-none border-none cursor-pointer active:scale-95"
+            >
+              <span class="material-symbols-outlined text-sm">check_circle</span>
+              {{ currentLang === 'km' ? 'រួចរាល់' : 'Done' }}
+            </button>
+          </div>
         </div>
       </div>
     </div>

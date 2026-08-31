@@ -45,28 +45,21 @@ export async function apiRequest<T = any>(
     : (endpoint.startsWith('/api') ? endpoint : `/api${endpoint}`)
   const url = path.startsWith('http') ? path : `${API_BASE_URL}${path}`
 
-  try {
-    const res = await fetch(url, {
-      ...options,
-      headers
-    })
+  const res = await fetch(url, {
+    ...options,
+    headers
+  })
 
-    const data: ApiResponse<T> = await res.json().catch(() => ({
-      message: res.statusText || 'Server Error',
-      errors: ['PARSE_ERROR']
-    }))
+  const data: ApiResponse<T> = await res.json().catch(() => ({
+    message: res.statusText || 'Server Error',
+    errors: ['PARSE_ERROR']
+  }))
 
-    if (!res.ok) {
-      const errorMsg = data.message || `Request failed with status ${res.status}`
-      console.warn(`[API ${options.method || 'GET'} ${url}] Error:`, errorMsg, data)
-      throw new Error(errorMsg)
-    }
-
-    return data
-  } catch (err: any) {
-    console.error(`[API Network Error] ${url}:`, err)
-    throw err
+  if (!res.ok) {
+    throw new Error(data.message || `Request failed with status ${res.status}`)
   }
+
+  return data
 }
 
 export const api = {

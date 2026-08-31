@@ -6,6 +6,7 @@ import { kitchenService, KitchenQueueItem } from '../services/kitchen.js'
 import { getSocket } from '../services/socket.js'
 import { getAccessToken, setAccessToken } from '../services/api.js'
 import { login, logout } from '../services/auth.js'
+import { resolveMediaUrl } from '../services/config.js'
 
 const router = useRouter()
 
@@ -77,7 +78,7 @@ const loadOrders = async () => {
             name: dish.name,
             price: 12.50,
             quantity: dish.quantity,
-            image: dish.image,
+            image: resolveMediaUrl(dish.image),
             status: orderStatus,
             customizations: dish.customizationNote || 'Standard Portions',
             customizedDetails: (dish.customizations || []).map((c: any) => ({
