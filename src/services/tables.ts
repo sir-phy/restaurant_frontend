@@ -4,10 +4,13 @@ import { OrderDetail } from './orders.js'
 export interface TableItem {
   id: number
   table_number: string
-  name?: string
+  name?: string | null
   capacity: number
-  location?: string
+  location?: string | null
   status: 'AVAILABLE' | 'OCCUPIED' | 'RESERVED' | 'INACTIVE'
+  is_active?: boolean
+  menu_token?: string | null
+  url?: string | null
   currentOrder?: OrderDetail | null
 }
 
@@ -40,7 +43,17 @@ export const tableService = {
   getTable: (id: number | string) => api.get<TableItem>(`/tables/${id}`),
 
   getTableQr: (id: number | string) =>
-    api.get<{ tableId: number; tableNo: string; url: string }>(`/tables/${id}/qr`),
+    api.get<{ tableId: number; tableNo: string; url: string; menuToken?: string }>(`/tables/${id}/qr`),
+
+  getTableByCode: (token: string) =>
+    api.get<{
+      id: number
+      table_number: string
+      name?: string | null
+      status: string
+      menu_token: string
+      url: string
+    }>(`/tables/code/${encodeURIComponent(token)}`),
 
   getCurrentOrder: (id: number | string) =>
     api.get<OrderDetail | null>(`/tables/${id}/current-order`),

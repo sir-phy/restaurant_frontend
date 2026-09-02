@@ -27,6 +27,7 @@ interface CustomizedDetail {
 interface OrderItem {
   id: number
   orderId?: number
+  orderIds?: number[]
   name: string
   price: number
   quantity: number
@@ -37,6 +38,74 @@ interface OrderItem {
   timePlaced?: string
   tableNo?: string
   servedAt?: number
+  createdAtMs?: number
+  customerLocation?: KitchenQueueItem['customerLocation']
+}
+
+const tableKey = (value: any) => String(value ?? '').trim().toLowerCase()
+const dishKey = (value: string) => String(value ?? '').trim().toLowerCase()
+
+const recipeKey = (item: Pick<OrderItem, 'customizedDetails' | 'customizations'>) => {
+  if (item.customizedDetails && item.customizedDetails.length > 0) {
+    return item.customizedDetails
+      .map((d) => `${d.name}:${d.amount}:${d.unit}`)
+      .sort()
+      .join('|')
+  }
+  const note = String(item.customizations || '').trim().toLowerCase()
+  if (!note || note === 'standard portions') return 'standard'
+  return note
+}
+
+/** Same dish + table + status + recipe → one KDS card with summed quantity. */
+const mergeSameDishCards = (items: OrderItem[]): OrderItem[] => {
+  const groups = new Map<string, OrderItem>()
+  for (const item of items) {
+    const key = [
+      tableKey(item.tableNo),
+      dishKey(item.name),
+      item.status,
+      recipeKey(item),
+    ].join('\0')
+    const existing = groups.get(key)
+    if (!existing) {
+      groups.set(key, {
+        ...item,
+        orderIds: item.orderId ? [item.orderId] : [],
+      })
+      continue
+    }
+    existing.quantity += Number(item.quantity) || 0
+    if (item.orderId && !existing.orderIds!.includes(item.orderId)) {
+      existing.orderIds!.push(item.orderId)
+    }
+    if ((item.createdAtMs ?? Infinity) < (existing.createdAtMs ?? Infinity)) {
+      existing.timePlaced = item.timePlaced
+      existing.createdAtMs = item.createdAtMs
+    }
+    if (!existing.image && item.image) existing.image = item.image
+    existing.customerLocation = worseLocation(existing.customerLocation, item.customerLocation)
+  }
+  return [...groups.values()]
+}
+
+const worseLocation = (
+  a?: KitchenQueueItem['customerLocation'],
+  b?: KitchenQueueItem['customerLocation'],
+) => {
+  if (!a) return b
+  if (!b) return a
+  if (a.onPremise === false && b.onPremise !== false) return a
+  if (b.onPremise === false && a.onPremise !== false) return b
+  const da = a.distanceMeters ?? 0
+  const db = b.distanceMeters ?? 0
+  return db > da ? b : a
+}
+
+const formatDistance = (meters: number | null | undefined) => {
+  if (meters == null || !Number.isFinite(meters)) return ''
+  if (meters < 1000) return `${Math.round(meters)} m`
+  return `${(meters / 1000).toFixed(1)} km`
 }
 
 // Active orders list synced with Backend and Customer view
@@ -121,11 +190,13 @@ const loadOrders = async () => {
             })),
             timePlaced: new Date(qItem.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
             tableNo: orderTable,
-            servedAt: qItem.status === 'SERVED' ? Date.now() : undefined
+            servedAt: qItem.status === 'SERVED' ? Date.now() : undefined,
+            createdAtMs: new Date(qItem.createdAt).getTime(),
+            customerLocation: qItem.customerLocation || null,
           })
         })
       })
-      orders.value = mapped
+      orders.value = mergeSameDishCards(mapped)
       return
     }
   } catch (err) {
@@ -224,14 +295,22 @@ const updateStatus = async (id: number, status: 'Preparing' | 'Sent to Kitchen' 
     }
     saveOrders()
 
-    // Call backend API endpoint if orderId exists
-    const backendOrderId = item.orderId || (item.id > 1000 ? Math.floor(item.id / 100) : item.id)
+    const backendIds = [
+      ...new Set(
+        (item.orderIds && item.orderIds.length
+          ? item.orderIds
+          : [item.orderId || (item.id > 1000 ? Math.floor(item.id / 100) : item.id)]
+        ).filter((oid): oid is number => Number.isFinite(Number(oid)) && Number(oid) > 0),
+      ),
+    ]
     try {
-      if (status === 'Sent to Kitchen') {
-        await kitchenService.startCooking(backendOrderId)
-      } else if (status === 'Served') {
-        await kitchenService.markReady(backendOrderId).catch(() => {})
-        await kitchenService.markServed(backendOrderId).catch(() => {})
+      for (const backendOrderId of backendIds) {
+        if (status === 'Sent to Kitchen') {
+          await kitchenService.startCooking(backendOrderId)
+        } else if (status === 'Served') {
+          await kitchenService.markReady(backendOrderId).catch(() => {})
+          await kitchenService.markServed(backendOrderId).catch(() => {})
+        }
       }
     } catch (apiErr) {
       console.log('Backend sync notice (proceeding):', apiErr)
@@ -708,11 +787,43 @@ const handleManualOrder = () => {
                 <span class="text-base leading-tight">{{ order.tableNo }}</span>
               </div>
               <div>
-                <h3 class="font-black text-xs text-on-surface">{{ currentLang === 'km' ? 'សំបុត្រកម្ម៉ង់ #' : 'Ticket #ORD-' }}{{ order.id % 10000 }}</h3>
+                <h3 class="font-black text-xs text-on-surface">
+                  <template v-if="(order.orderIds?.length || 1) > 1">
+                    {{ currentLang === 'km' ? `${order.orderIds?.length} សំបុត្ររួម` : `${order.orderIds?.length} tickets combined` }}
+                  </template>
+                  <template v-else>
+                    {{ currentLang === 'km' ? 'សំបុត្រកម្ម៉ង់ #' : 'Ticket #ORD-' }}{{ order.id % 10000 }}
+                  </template>
+                </h3>
                 <div class="flex items-center gap-1 text-[10px] text-outline mt-0.5 font-bold">
                   <span class="material-symbols-outlined text-[12px] font-black">schedule</span>
                   <span>{{ order.timePlaced }}</span>
                 </div>
+                <a
+                  v-if="order.customerLocation"
+                  :href="order.customerLocation.mapsUrl"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="inline-flex items-center gap-1 mt-1.5 px-2 py-0.5 rounded-full text-[9px] font-black uppercase tracking-wider no-underline"
+                  :class="order.customerLocation.onPremise === false
+                    ? 'bg-rose-100 text-rose-800'
+                    : order.customerLocation.onPremise
+                      ? 'bg-emerald-100 text-emerald-800'
+                      : 'bg-slate-100 text-slate-700'"
+                >
+                  <span class="material-symbols-outlined text-[12px]">location_on</span>
+                  <span v-if="order.customerLocation.onPremise === false">
+                    {{ currentLang === 'km'
+                      ? `នៅឆ្ងាយ ${formatDistance(order.customerLocation.distanceMeters)}`
+                      : `${formatDistance(order.customerLocation.distanceMeters)} away` }}
+                  </span>
+                  <span v-else-if="order.customerLocation.onPremise">
+                    {{ currentLang === 'km' ? 'នៅភោជនីយដ្ឋាន' : 'At restaurant' }}
+                  </span>
+                  <span v-else>
+                    {{ currentLang === 'km' ? 'មើលទីតាំង' : 'View location' }}
+                  </span>
+                </a>
               </div>
             </div>
 

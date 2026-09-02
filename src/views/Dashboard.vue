@@ -1048,31 +1048,8 @@ watch(currentLang, () => {
 
 <template>
   <div class="min-h-screen">
-    <!-- Header -->
-    <header class="fixed top-0 left-0 right-0 lg:left-64 h-20 bg-white/80 backdrop-blur-md border-b border-surface-variant flex items-center justify-between px-8 z-40">
-      <h2 class="text-xl font-black text-on-surface">{{ currentLang === 'km' ? 'ផ្ទាំងគ្រប់គ្រងម្ចាស់ហាង' : 'Owner Dashboard' }}</h2>
-      
-      <div class="flex items-center gap-6">
-        <div class="flex items-center px-4 py-2 bg-tertiary/10 rounded-full gap-2">
-          <span class="w-2 h-2 bg-tertiary rounded-full animate-pulse"></span>
-          <span class="text-xs font-bold text-tertiary">{{ currentLang === 'km' ? 'ផ្ទះបាយកំពុងដំណើរការ' : 'KITCHEN LIVE' }}</span>
-        </div>
-
-        <div class="flex items-center gap-4 text-on-surface-variant border-l border-surface-variant pl-6">
-          <button class="p-2 hover:bg-surface-container rounded-full transition-colors relative">
-            <span class="material-symbols-outlined">notifications</span>
-            <span class="absolute top-2 right-2 w-2 h-2 bg-secondary rounded-full"></span>
-          </button>
-        </div>
-
-        <div class="h-10 w-10 rounded-full overflow-hidden border-2 border-primary-container shrink-0">
-          <img src="https://images.unsplash.com/photo-1544005313-94ddf0286df2?auto=format&fit=crop&q=80&w=200" alt="Avatar" />
-        </div>
-      </div>
-    </header>
-
-    <!-- Main Content -->
-    <main class="mt-20 p-8 w-full max-w-7xl mx-auto space-y-8">
+    <!-- Main Content (top bar lives in OwnerLayout so it stays put on page switch) -->
+    <main class="p-6 md:p-8 w-full max-w-7xl mx-auto space-y-8">
       <!-- Stats Grid -->
       <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         <div 

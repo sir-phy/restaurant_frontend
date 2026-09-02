@@ -3,6 +3,11 @@ import { api } from './api.js'
 export interface CreateOrderPayload {
   tableId: number | string
   customerName?: string
+  location?: {
+    latitude: number
+    longitude: number
+    accuracyMeters?: number
+  }
   items: Array<{
     menuItemId: number
     quantity: number
@@ -65,6 +70,14 @@ export interface OrderDetail {
   servedAt?: string | null
   paidAt?: string | null
   cancelledAt?: string | null
+  customerLocation?: {
+    latitude: number
+    longitude: number
+    accuracyMeters: number | null
+    distanceMeters: number | null
+    onPremise: boolean | null
+    mapsUrl: string
+  } | null
 }
 
 export const orderService = {

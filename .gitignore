@@ -1,24 +1,30 @@
 # ── Secrets ─────────────────────────────────────────────────────────────────
-# Never commit environment files containing real credentials.
+# Never commit environment files with real credentials or machine-specific URLs.
 .env
 .env.*
 .env.local
 .env.production
+.envrc
+*.local
 !.env.example
 
 # ── Dependencies ────────────────────────────────────────────────────────────
 node_modules/
 
-# ── Build output / caches ─────────────────────────────────────────────────────
+# ── Build output / caches ───────────────────────────────────────────────────
 dist/
+dist-ssr/
 build/
 out/
 .vite/
+.cache/
 *.tsbuildinfo
 
 # ── Logs ────────────────────────────────────────────────────────────────────
+logs/
 *.log
 npm-debug.log*
+yarn-debug.log*
 yarn-error.log
 pnpm-debug.log*
 
@@ -29,6 +35,9 @@ Thumbs.db
 *.swo
 .idea/
 .vscode/
+.cursor/
 
 # ── Test artifacts ──────────────────────────────────────────────────────────
 coverage/
+playwright-report/
+test-results/

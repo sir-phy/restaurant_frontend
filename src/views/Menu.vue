@@ -22,6 +22,7 @@ import { getAccessToken } from '../services/api.js'
 import { API_BASE_URL, resolveMediaUrl } from '../services/config.js'
 import OffersBoard from '../components/OffersBoard.vue'
 import { promotionService, type Pairing, type Promotion } from '../services/offers.js'
+import { settingsService } from '../services/settings.js'
 
 const route = useRoute()
 
@@ -373,7 +374,8 @@ const resolveAndJoinTableRoom = async () => {
       const list = Array.isArray(tablesRes.data) ? tablesRes.data : []
       const match = list.find((t: any) =>
         tableKey(t.table_number) === tableKey(currentTable.value) ||
-        tableKey(t.id) === tableKey(currentTable.value)
+        tableKey(t.id) === tableKey(currentTable.value) ||
+        tableKey(t.menu_token) === tableKey(currentTable.value)
       )
       if (match?.id) tableNumericId.value = Number(match.id)
     }
@@ -408,10 +410,50 @@ const placeBackendOrder = async (items: Array<{
 }>) => {
   await ensureGuestSession()
   await resolveAndJoinTableRoom()
+  orderSuccessMessage.value = currentLang.value === 'km'
+    ? 'កំពុងបញ្ជាក់ទីតាំងរបស់អ្នក...'
+    : 'Confirming you are at the restaurant...'
+  isOrderSuccessToastVisible.value = true
+  const location = await requestOrderLocation()
+  isOrderSuccessToastVisible.value = false
   const tableId = tableNumericId.value ?? currentTable.value
-  const res = await orderService.createOrder({ tableId, items })
+  const res = await orderService.createOrder({ tableId, items, location })
   await resolveAndJoinTableRoom()
   return res.data
+}
+
+const requestOrderLocation = (): Promise<{
+  latitude: number
+  longitude: number
+  accuracyMeters?: number
+}> => {
+  return new Promise((resolve, reject) => {
+    if (typeof navigator === 'undefined' || !navigator.geolocation) {
+      reject(new Error(
+        currentLang.value === 'km'
+          ? 'ត្រូវការទីតាំងដើម្បីកុម្ម៉ង់។ សូមបើក GPS លើឧបករណ៍នេះ។'
+          : 'Location is required to order. Enable GPS on this device.',
+      ))
+      return
+    }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        resolve({
+          latitude: pos.coords.latitude,
+          longitude: pos.coords.longitude,
+          accuracyMeters: Number.isFinite(pos.coords.accuracy) ? pos.coords.accuracy : undefined,
+        })
+      },
+      () => {
+        reject(new Error(
+          currentLang.value === 'km'
+            ? 'សូមអនុញ្ញាតទីតាំង ដើម្បីបញ្ជាក់ថាអ្នកកំពុងនៅភោជនីយដ្ឋាន។'
+            : 'Allow location to order — this confirms you are at the restaurant.',
+        ))
+      },
+      { enableHighAccuracy: true, timeout: 12000, maximumAge: 30000 },
+    )
+  })
 }
 
 const loadOrders = () => {
@@ -474,12 +516,12 @@ const activeDisplayOrders = computed(() => {
 // on the backend, renders the backend's QR payload, polls the backend status
 // endpoint (which triggers Bakong verification) and only shows the receipt
 // once the backend reports PAID. States:
-//   creating → pending → success | failed | expired
+//   creating → pending → scanned → success | failed | expired
 const isOrdersModalOpen = ref(false)
 const isPaymentQrModalOpen = ref(false)
 const billingAmount = ref(0)
 const qrType = ref<'dynamic' | 'static'>('dynamic')
-type PaymentStage = 'creating' | 'pending' | 'success' | 'failed' | 'expired'
+type PaymentStage = 'creating' | 'pending' | 'scanned' | 'success' | 'failed' | 'expired'
 const paymentStage = ref<PaymentStage>('creating')
 const activePayment = ref<KhqrCreateResult | null>(null)
 const paymentError = ref('')
@@ -504,6 +546,16 @@ const paymentSimulatedTxId = ref('')
 // verified PAID. Stays on screen until the customer explicitly closes it.
 const isReceiptModalOpen = ref(false)
 const paymentReceipt = ref<any>(null)
+
+const scanSuccessHint = computed(() =>
+  currentLang.value === 'km'
+    ? 'បន្ទាប់ពីអ្នកបង់ប្រាក់តាមរយៈកម្មវិធីធនាគារ វិក្កយបត្រនឹងបង្ហាញដោយស្វ័យប្រវត្តិ។'
+    : 'Confirm the payment in your bank app. Your receipt opens the moment Bakong receives the money.',
+)
+
+const pendingScanTitle = computed(() =>
+  currentLang.value === 'km' ? 'សូមស្កេន QR ដើម្បីបង់ប្រាក់' : 'Scan the QR to pay',
+)
 
 const playSuccessChime = () => {
   try {
@@ -534,12 +586,25 @@ const playSuccessChime = () => {
   }
 }
 
+/** Bakong has no "QR scanned" webhook — this is the customer-side signal. */
+const markScanSuccess = () => {
+  if (paymentStage.value === 'pending' || paymentStage.value === 'creating') {
+    paymentStage.value = 'scanned'
+  }
+}
+
+const openAbaSimulator = () => {
+  markScanSuccess()
+  isAbaSimulatorOpen.value = true
+}
+
 const triggerAbaDeepLink = () => {
   // Deep-links the ACTIVE payload — the backend-generated KHQR when a payment
   // is active (its MD5 is what verification is keyed on), the local static
   // merchant QR otherwise.
   const khqr = activeQrPayload.value
   const deepLinkUrl = `https://payment.bakong.org.kh/pay?code=${encodeURIComponent(khqr)}`
+  markScanSuccess()
   try {
     const win = window.open(deepLinkUrl, '_blank')
     if (!win) {
@@ -584,12 +649,47 @@ const stopPaymentPolling = () => {
   }
 }
 
+const applyLivePaymentStatus = async (status: {
+  status?: string
+  paymentId?: number
+  invoiceId?: number
+  amount?: number
+  currency?: string
+  transactionHash?: string
+  paidAt?: string
+} | null | undefined) => {
+  if (!status?.status) return
+  if (status.status === 'PAID') {
+    stopPaymentPolling()
+    await openVerifiedReceipt(status)
+    return
+  }
+  if (status.status === 'EXPIRED' || status.status === 'CANCELLED') {
+    stopPaymentPolling()
+    paymentStage.value = 'expired'
+    return
+  }
+  if (status.status === 'FAILED') {
+    stopPaymentPolling()
+    paymentStage.value = 'failed'
+    return
+  }
+  if (status.status === 'PROCESSING') {
+    // PROCESSING only means we asked Bakong (check by MD5 / hash / short hash).
+    // It is not a scan event — keep "Scan success" if the customer already
+    // opened their bank app; otherwise stay on waiting-to-scan.
+    return
+  }
+  if (paymentStage.value !== 'scanned' && paymentStage.value !== 'success') {
+    paymentStage.value = 'pending'
+  }
+}
+
 const startPaymentPolling = () => {
   stopPaymentPolling()
-  // Nudges a backend Bakong verification every ~4s (server rate limit: 60/min).
-  // Keep polling even if the QR modal is closed — the receipt must still pop
-  // up the moment Bakong confirms the restaurant account received the money.
-  paymentPollTimer = setInterval(pollPaymentStatus, 4000)
+  // Bakong has no scan webhook — we poll check_transaction_by_md5 via
+  // POST /verify. 2s keeps us under the 60/min verify budget.
+  paymentPollTimer = setInterval(pollPaymentStatus, 2000)
   pollPaymentStatus()
 }
 
@@ -597,29 +697,40 @@ const pollPaymentStatus = async () => {
   if (isReceiptModalOpen.value) return
   if (paymentStage.value === 'success') return
   if (!activePayment.value) return
-  if (paymentStage.value !== 'pending' && paymentStage.value !== 'creating') return
+  if (
+    paymentStage.value !== 'pending' &&
+    paymentStage.value !== 'creating' &&
+    paymentStage.value !== 'scanned'
+  ) {
+    return
+  }
   const paymentId = activePayment.value.paymentId
   try {
-    paymentService.verifyPayment(paymentId).catch(() => {})
+    try {
+      const verified = await paymentService.verifyPayment(paymentId)
+      if (verified.data?.status === 'PAID') {
+        const paid = await paymentService.getPaymentStatus(paymentId)
+        await applyLivePaymentStatus(paid.data || verified.data)
+        return
+      }
+      await applyLivePaymentStatus(verified.data)
+    } catch (verifyErr: any) {
+      const msg = String(verifyErr?.message || '')
+      if (msg === 'Bakong transaction not found') {
+        /* QR not paid yet — keep waiting */
+      } else if (msg === 'Payment has expired') {
+        stopPaymentPolling()
+        paymentStage.value = 'expired'
+        return
+      } else if (msg === 'Payment verification failed') {
+        stopPaymentPolling()
+        paymentStage.value = 'failed'
+        return
+      }
+    }
 
     const res = await paymentService.getPaymentStatus(paymentId)
-    const status = res.data
-    if (!status) return
-    if (status.status === 'PAID') {
-      stopPaymentPolling()
-      await openVerifiedReceipt(status)
-    } else if (status.status === 'EXPIRED') {
-      stopPaymentPolling()
-      paymentStage.value = 'expired'
-    } else if (status.status === 'FAILED') {
-      stopPaymentPolling()
-      paymentStage.value = 'failed'
-    } else if (status.status === 'CANCELLED') {
-      stopPaymentPolling()
-      paymentStage.value = 'expired'
-    } else {
-      paymentStage.value = 'pending'
-    }
+    await applyLivePaymentStatus(res.data)
   } catch (pollErr) {
     console.warn('Payment status poll retry:', pollErr)
   }
@@ -694,7 +805,7 @@ const buildPaidReceipt = (statusData: any, invoice: any) => {
     subtotal,
     tax,
     discount,
-    serviceFee: 0,
+    serviceFee: Number(invoice?.serviceFee ?? invoice?.service_fee ?? 0),
     total,
     currency: statusData.currency || invoice?.currency || 'USD',
     transactionHash: statusData.transactionHash || activePayment.value?.transactionNumber || '',
@@ -931,6 +1042,7 @@ const resetSimulationState = () => {
 }
 
 const payWithSimulatorDirectly = () => {
+  markScanSuccess()
   isAbaSimulatorOpen.value = true
   confirmSandboxSettle()
 }
@@ -1032,16 +1144,31 @@ const buildKhqr = (amount: number | null, billNumber: string, terminalLabel: str
 // Declared BEFORE the QR computeds and the immediate QR watcher below: that
 // watcher evaluates khqrData during setup, so this whole dependency chain
 // must already be initialized (otherwise: TDZ ReferenceError → white screen).
+const taxPercent = ref(10)
+const serviceFeePercent = ref(2)
+
+const loadFeeSettings = async () => {
+  try {
+    const res = await settingsService.getSettings()
+    if (res.data) {
+      taxPercent.value = Number(res.data.taxPercent)
+      serviceFeePercent.value = Number(res.data.serviceFeePercent)
+    }
+  } catch (err) {
+    console.warn('Fee settings load notice:', err)
+  }
+}
+
 const orderSubtotal = computed(() => {
   return myOrders.value.reduce((acc: number, item: any) => acc + (item.price * item.quantity), 0)
 })
 
 const orderTax = computed(() => {
-  return +(orderSubtotal.value * 0.1).toFixed(2)
+  return +(orderSubtotal.value * (Number(taxPercent.value) || 0) / 100).toFixed(2)
 })
 
 const orderServiceFee = computed(() => {
-  return +(orderSubtotal.value * 0.05).toFixed(2)
+  return +(orderSubtotal.value * (Number(serviceFeePercent.value) || 0) / 100).toFixed(2)
 })
 
 const orderTotal = computed(() => {
@@ -1411,6 +1538,29 @@ const dismissDelayMessage = () => {
   window.dispatchEvent(new Event('storage'))
 }
 
+const applyGuestTable = (tableNo: string, numericId?: number) => {
+  localStorage.setItem('gomeal_selected_table', tableNo)
+  currentTable.value = tableNo
+  if (numericId) tableNumericId.value = numericId
+  if (!localStorage.getItem('gomeal_customer_name')) {
+    localStorage.setItem('gomeal_customer_name', `Guest at Table ${tableNo}`)
+  }
+}
+
+const resolveGuestTableLink = async () => {
+  const code = String(route.params.code || '').trim()
+  if (!code) return
+  try {
+    const res = await tableService.getTableByCode(code)
+    const tableNo = String(res.data?.table_number || '')
+    if (tableNo) {
+      applyGuestTable(tableNo, Number(res.data?.id) || undefined)
+    }
+  } catch (err) {
+    console.log('Table link resolve notice:', err)
+  }
+}
+
 const syncMenuData = () => {
   // Check route parameter for table number first
   if (route.params.tableId) {
@@ -1499,6 +1649,7 @@ const refreshMenuFromBackend = async () => {
 }
 
 onMounted(async () => {
+  await resolveGuestTableLink()
   syncMenuData()
   window.addEventListener('storage', syncMenuData)
 
@@ -1517,6 +1668,7 @@ onMounted(async () => {
 
   // Load latest categories and menu items from backend API
   await refreshMenuFromBackend()
+  await loadFeeSettings()
 
   // Real-Time Socket.IO connection and Table Room
   try {
@@ -1559,14 +1711,22 @@ onMounted(async () => {
 
   await resumePendingPaymentWatch()
 
+  const onPaymentVisibility = () => {
+    if (document.hidden && isPaymentQrModalOpen.value) {
+      markScanSuccess()
+    }
+  }
+  document.addEventListener('visibilitychange', onPaymentVisibility)
+
   // Poll backend so menu items added in Menu Management appear without reload.
   const interval = setInterval(() => {
     syncMenuData()
     refreshMenuFromBackend()
-  }, 2500)
+  }, 10000)
   onUnmounted(() => {
     clearInterval(interval)
     stopPaymentPolling()
+    document.removeEventListener('visibilitychange', onPaymentVisibility)
     try {
       getSocket().off('payment.paid')
     } catch {
@@ -2214,11 +2374,11 @@ onMounted(async () => {
               <span class="font-black text-on-surface">${{ orderSubtotal.toFixed(2) }}</span>
             </div>
             <div class="flex items-center justify-between text-xs text-on-surface-variant font-bold">
-              <span>{{ t('taxAndFees') }}</span>
+              <span>{{ t('taxAndFees') }} ({{ taxPercent }}%)</span>
               <span class="font-black text-on-surface">${{ orderTax.toFixed(2) }}</span>
             </div>
             <div class="flex items-center justify-between text-xs text-on-surface-variant font-bold">
-              <span>{{ t('serviceCharge') }}</span>
+              <span>{{ t('serviceCharge') }} ({{ serviceFeePercent }}%)</span>
               <span class="font-black text-on-surface">${{ orderServiceFee.toFixed(2) }}</span>
             </div>
             <div class="flex items-center justify-between pt-2 border-t border-outline-variant/30">
@@ -2420,6 +2580,26 @@ onMounted(async () => {
           <span class="material-symbols-outlined text-primary text-2xl mb-1 bg-primary/10 p-2 rounded-full animate-pulse">qr_code_scanner</span>
           <h3 class="text-base sm:text-lg font-black text-on-surface">{{ currentLang === 'km' ? 'ស្កេន និងទូទាត់ប្រាក់ (បាគង / KHQR)' : 'Scan & Pay (Bakong / KHQR)' }}</h3>
           <p class="text-[10px] sm:text-[11px] text-on-surface-variant/80 font-bold uppercase tracking-wider mt-0.5">{{ currentLang === 'km' ? 'ការទូទាត់ឌីជីថល តុលេខ #' + currentTable : 'Table #' + currentTable + ' Digital Settlement' }}</p>
+          <span
+            class="inline-flex items-center gap-1 mt-2 text-[9px] font-black uppercase tracking-widest px-2.5 py-1 rounded-full"
+            :class="
+              paymentStage === 'scanned' ? 'bg-sky-100 text-sky-800' :
+              paymentStage === 'pending' ? 'bg-amber-100 text-amber-800' :
+              paymentStage === 'failed' ? 'bg-rose-100 text-rose-800' :
+              paymentStage === 'expired' ? 'bg-amber-100 text-amber-800' :
+              'bg-slate-100 text-slate-600'
+            "
+          >
+            <span class="w-1.5 h-1.5 rounded-full bg-current animate-pulse"></span>
+            {{
+              paymentStage === 'scanned' ? (currentLang === 'km' ? 'ស្កេនបានជោគជ័យ' : 'Scan success') :
+              paymentStage === 'pending' ? (currentLang === 'km' ? 'រង់ចាំស្កេន' : 'Waiting to scan') :
+              paymentStage === 'creating' ? (currentLang === 'km' ? 'កំពុងរៀបចំ QR' : 'Preparing QR') :
+              paymentStage === 'failed' ? (currentLang === 'km' ? 'បរាជ័យ' : 'Failed') :
+              paymentStage === 'expired' ? (currentLang === 'km' ? 'ផុតកំណត់' : 'Expired') :
+              paymentStage
+            }}
+          </span>
           <button 
             @click="closePaymentModal"
             class="absolute top-3 right-3 p-1.5 bg-white rounded-full hover:bg-surface-container text-outline hover:text-on-surface transition-all shadow-sm outline-none border-none cursor-pointer"
@@ -2469,7 +2649,7 @@ onMounted(async () => {
                    hidden entirely in non-sandbox environments. -->
               <button
                 v-if="isSandboxUiEnabled"
-                @click="isAbaSimulatorOpen = true"
+                @click="openAbaSimulator"
                 type="button"
                 class="bg-amber-600 hover:bg-amber-700 text-white py-2.5 px-3 rounded-xl text-center font-black text-[10px] tracking-wide flex items-center justify-center gap-1 border-none shadow-sm active:scale-95 transition-all outline-none cursor-pointer"
               >
@@ -2549,23 +2729,40 @@ onMounted(async () => {
             <div class="flex items-center gap-1.5 text-slate-600">
               <span class="material-symbols-outlined text-base text-primary">qr_code_scanner</span>
               <span class="text-[11px] sm:text-xs font-black uppercase tracking-widest">
-                {{ currentLang === 'km' ? 'ស្កេនដើម្បីបង់ប្រាក់' : 'Scan to Pay' }}
+                {{ paymentStage === 'scanned'
+                  ? (currentLang === 'km' ? 'ស្កេនបានជោគជ័យ' : 'Scan success')
+                  : (currentLang === 'km' ? 'ស្កេនដើម្បីបង់ប្រាក់' : 'Scan to Pay') }}
               </span>
             </div>
 
             <!-- Waiting for payment confirmation (polls the backend; the
                  backend verifies with Bakong — the client never self-declares) -->
             <div
-              v-if="paymentStage === 'pending'"
+              v-if="paymentStage === 'scanned'"
+              class="w-full bg-sky-50 border border-sky-200 rounded-2xl px-4 py-3 flex items-center gap-3"
+            >
+              <span class="material-symbols-outlined text-sky-600 text-xl shrink-0">verified</span>
+              <div class="min-w-0 flex-1 text-left">
+                <p class="text-[11px] font-black text-sky-800 leading-tight">
+                  {{ currentLang === 'km' ? 'ស្កេនបានជោគជ័យ' : 'Scan success' }}
+                </p>
+                <p class="text-[10px] text-sky-700/80 font-bold mt-0.5 leading-snug">
+                  {{ scanSuccessHint }}
+                </p>
+              </div>
+            </div>
+
+            <div
+              v-else-if="paymentStage === 'pending'"
               class="w-full bg-emerald-50 border border-emerald-200 rounded-2xl px-4 py-3 flex items-center gap-3"
             >
               <span class="material-symbols-outlined text-emerald-600 text-xl animate-spin shrink-0">progress_activity</span>
               <div class="min-w-0 flex-1 text-left">
                 <p class="text-[11px] font-black text-emerald-800 leading-tight">
-                  {{ currentLang === 'km' ? 'កំពុងរង់ចាំការបញ្ជាក់ការទូទាត់ប្រាក់...' : 'Waiting for Payment Confirmation...' }}
+                  {{ pendingScanTitle }}
                 </p>
                 <p class="text-[10px] text-emerald-700/80 font-bold mt-0.5 leading-snug">
-                  {{ currentLang === 'km' ? 'បន្ទាប់ពីអ្នកបង់ប្រាក់តាមរយៈកម្មវិធីធនាគារ វិក្កយបត្រនឹងបង្ហាញដោយស្វ័យប្រវត្តិ។' : 'After you pay in your banking app, your verified receipt appears here automatically.' }}
+                  {{ currentLang === 'km' ? 'បន្ទាប់ពីអ្នកបង់ប្រាក់តាមរយៈកម្មវិធីធនាគារ វិក្កយបត្រនឹងបង្ហាញដោយស្វ័យប្រវត្តិ។' : 'After you pay in your banking app, Bakong confirms the transfer and your receipt opens here.' }}
                 </p>
               </div>
             </div>
@@ -2599,6 +2796,43 @@ onMounted(async () => {
                   @click="closePaymentModal"
                   type="button"
                   class="bg-white hover:bg-amber-50 text-amber-700 border border-amber-200 rounded-xl py-2.5 font-black text-[10px] uppercase tracking-wider flex items-center justify-center gap-1.5 cursor-pointer outline-none active:scale-95 transition-all"
+                >
+                  <span class="material-symbols-outlined text-sm">close</span>
+                  {{ currentLang === 'km' ? 'បោះបង់' : 'Cancel' }}
+                </button>
+              </div>
+            </div>
+
+            <div
+              v-else-if="paymentStage === 'failed'"
+              class="w-full bg-rose-50 border border-rose-200 rounded-2xl px-4 py-3.5 flex flex-col gap-3"
+            >
+              <div class="flex items-start gap-2">
+                <span class="material-symbols-outlined text-rose-600 font-extrabold text-xl shrink-0">error</span>
+                <div class="min-w-0 flex-1">
+                  <p class="text-[12px] font-black text-rose-800 uppercase tracking-wider leading-none">
+                    {{ currentLang === 'km' ? 'ការទូទាត់បរាជ័យ' : 'Payment Failed' }}
+                  </p>
+                  <p class="text-[10px] text-rose-700/90 font-semibold mt-1 leading-relaxed">
+                    {{ paymentError || (currentLang === 'km'
+                      ? 'Bakong មិនអាចបញ្ជាក់ប្រតិបត្តិការនេះបានទេ។ សូមព្យាយាមម្តងទៀត។'
+                      : 'Bakong could not confirm this transfer. Please try again.') }}
+                  </p>
+                </div>
+              </div>
+              <div class="grid grid-cols-2 gap-2">
+                <button
+                  @click="retryFailedPayment"
+                  type="button"
+                  class="bg-rose-600 hover:bg-rose-700 text-white rounded-xl py-2.5 font-black text-[10px] uppercase tracking-wider flex items-center justify-center gap-1.5 border-none cursor-pointer outline-none active:scale-95 transition-all"
+                >
+                  <span class="material-symbols-outlined text-sm">refresh</span>
+                  {{ currentLang === 'km' ? 'ព្យាយាមម្តងទៀត' : 'Try Again' }}
+                </button>
+                <button
+                  @click="closePaymentModal"
+                  type="button"
+                  class="bg-white hover:bg-rose-50 text-rose-700 border border-rose-200 rounded-xl py-2.5 font-black text-[10px] uppercase tracking-wider flex items-center justify-center gap-1.5 cursor-pointer outline-none active:scale-95 transition-all"
                 >
                   <span class="material-symbols-outlined text-sm">close</span>
                   {{ currentLang === 'km' ? 'បោះបង់' : 'Cancel' }}
@@ -2707,7 +2941,7 @@ onMounted(async () => {
               <span class="text-slate-950">${{ Number(paymentReceipt.subtotal || 0).toFixed(2) }}</span>
             </div>
             <div class="flex justify-between">
-              <span>{{ currentLang === 'km' ? 'ពន្ធអាករ (10%)៖' : 'VAT (10%) :' }}</span>
+              <span>{{ currentLang === 'km' ? `ពន្ធអាករ (${taxPercent}%)៖` : `VAT (${taxPercent}%) :` }}</span>
               <span class="text-slate-950">${{ Number(paymentReceipt.tax || 0).toFixed(2) }}</span>
             </div>
             <div v-if="Number(paymentReceipt.discount) > 0" class="flex justify-between">
@@ -2715,7 +2949,7 @@ onMounted(async () => {
               <span class="text-slate-950">-${{ Number(paymentReceipt.discount).toFixed(2) }}</span>
             </div>
             <div v-if="Number(paymentReceipt.serviceFee) > 0" class="flex justify-between">
-              <span>{{ currentLang === 'km' ? 'សេវាកម្ម (5%)៖' : 'Service Fee (5%) :' }}</span>
+              <span>{{ currentLang === 'km' ? `សេវាកម្ម (${serviceFeePercent}%)៖` : `Service Fee (${serviceFeePercent}%) :` }}</span>
               <span class="text-slate-950">${{ Number(paymentReceipt.serviceFee).toFixed(2) }}</span>
             </div>
             <div class="flex justify-between text-sm pt-2 border-t-2 border-dashed border-slate-200">

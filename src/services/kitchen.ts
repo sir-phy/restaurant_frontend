@@ -12,6 +12,14 @@ export interface KitchenQueueItem {
   status: 'PENDING' | 'SENT_TO_KITCHEN' | 'PREPARING' | 'READY' | 'SERVED'
   createdAt: string
   customerName?: string
+  customerLocation?: {
+    latitude: number
+    longitude: number
+    accuracyMeters: number | null
+    distanceMeters: number | null
+    onPremise: boolean | null
+    mapsUrl: string
+  } | null
   items: Array<{
     id: number
     name: string

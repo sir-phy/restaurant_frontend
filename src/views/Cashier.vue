@@ -7,6 +7,7 @@ import { tableService } from '../services/tables'
 import { getSocket } from '../services/socket'
 import { invoiceService } from '../services/invoices'
 import { logout } from '../services/auth'
+import { settingsService } from '../services/settings'
 
 const router = useRouter()
 
@@ -47,6 +48,20 @@ interface SettleTransaction {
 
 // Standard active orders list, shared with Menu and Chef
 const activeOrders = ref<OrderItem[]>([])
+const taxPercent = ref(10)
+const serviceFeePercent = ref(2)
+
+const loadFeeSettings = async () => {
+  try {
+    const res = await settingsService.getSettings()
+    if (res.data) {
+      taxPercent.value = Number(res.data.taxPercent)
+      serviceFeePercent.value = Number(res.data.serviceFeePercent)
+    }
+  } catch (err) {
+    console.warn('Fee settings load notice:', err)
+  }
+}
 // Saved cashier transactions list
 const transactions = ref<SettleTransaction[]>([])
 
@@ -125,11 +140,11 @@ const tableSessions = computed(() => {
     }
   })
 
-  // Calculate totals and apply formulas: Subtotal + 10% Tax + 5% Service Fee
+  // Calculate totals: Subtotal + tax% + service fee%
   Object.keys(groups).forEach(table => {
     const subtotal = groups[table].items.reduce((sum, item) => sum + (item.price * item.quantity), 0)
-    const tax = subtotal * 0.10
-    const serviceFee = subtotal * 0.05
+    const tax = subtotal * (Number(taxPercent.value) || 0) / 100
+    const serviceFee = subtotal * (Number(serviceFeePercent.value) || 0) / 100
     groups[table].total = +(subtotal + tax + serviceFee).toFixed(2)
   })
 
@@ -164,11 +179,11 @@ const subtotalVal = computed(() => {
 })
 
 const taxVal = computed(() => {
-  return +(subtotalVal.value * 0.10).toFixed(2)
+  return +(subtotalVal.value * (Number(taxPercent.value) || 0) / 100).toFixed(2)
 })
 
 const serviceFeeVal = computed(() => {
-  return +(subtotalVal.value * 0.05).toFixed(2)
+  return +(subtotalVal.value * (Number(serviceFeePercent.value) || 0) / 100).toFixed(2)
 })
 
 const grandTotalVal = computed(() => {
@@ -537,7 +552,7 @@ const invoiceToReceipt = (invoice: any, payload: any): SettleTransaction => {
     items,
     subtotal,
     tax,
-    serviceFee: 0,
+    serviceFee: Number(invoice?.serviceFee ?? invoice?.service_fee ?? 0),
     total,
     paymentMethod: mapInvoicePaymentMethod(invoice?.paymentMethod || payload?.paymentMethod),
   }
@@ -579,6 +594,7 @@ const onPaymentPaid = async (payload: any) => {
 
 onMounted(() => {
   loadData()
+  loadFeeSettings()
   window.addEventListener('storage', onStorageUpdate)
   
   try {
@@ -889,11 +905,11 @@ onUnmounted(() => {
                   <span class="text-slate-700 font-black">${{ subtotalVal.toFixed(2) }}</span>
                 </div>
                 <div class="flex justify-between items-center text-xs font-bold text-slate-400">
-                  <span>{{ currentLang === 'km' ? 'ពន្ធអាករ / VAT (10%)' : 'VAT / Tax (10%)' }}</span>
+                  <span>{{ currentLang === 'km' ? `ពន្ធអាករ / VAT (${taxPercent}%)` : `VAT / Tax (${taxPercent}%)` }}</span>
                   <span class="text-slate-700 font-black">${{ taxVal.toFixed(2) }}</span>
                 </div>
                 <div class="flex justify-between items-center text-xs font-bold text-slate-400">
-                  <span>{{ currentLang === 'km' ? 'សេវាកម្ម (5%)' : 'Service Fee (5%)' }}</span>
+                  <span>{{ currentLang === 'km' ? `សេវាកម្ម (${serviceFeePercent}%)` : `Service Fee (${serviceFeePercent}%)` }}</span>
                   <span class="text-slate-700 font-black">${{ serviceFeeVal.toFixed(2) }}</span>
                 </div>
                 <div class="pt-2 border-t border-slate-200 flex justify-between items-center">
@@ -1204,11 +1220,11 @@ onUnmounted(() => {
             <span class="text-slate-950">${{ viewingReceipt.subtotal.toFixed(2) }}</span>
           </div>
           <div class="flex justify-between">
-            <span>{{ currentLang === 'km' ? 'ពន្ធអាករ (10%)៖' : 'VA Tax (10%) :' }}</span>
+            <span>{{ currentLang === 'km' ? `ពន្ធអាករ (${taxPercent}%)៖` : `VA Tax (${taxPercent}%) :` }}</span>
             <span class="text-slate-950">${{ viewingReceipt.tax.toFixed(2) }}</span>
           </div>
           <div class="flex justify-between">
-            <span>{{ currentLang === 'km' ? 'សេវាកម្ម (5%)៖' : 'Service Fee (5%) :' }}</span>
+            <span>{{ currentLang === 'km' ? `សេវាកម្ម (${serviceFeePercent}%)៖` : `Service Fee (${serviceFeePercent}%) :` }}</span>
             <span class="text-slate-950">${{ viewingReceipt.serviceFee.toFixed(2) }}</span>
           </div>
           <div class="flex justify-between text-sm pt-2 border-t-2 border-dashed border-slate-200">

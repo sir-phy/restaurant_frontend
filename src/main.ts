@@ -14,6 +14,12 @@ const router = createRouter({
       meta: { public: true }
     },
     {
+      path: '/t/:code',
+      name: 'table-link',
+      component: () => import('./views/Menu.vue'),
+      meta: { public: true, allowAll: true }
+    },
+    {
       path: '/menu/:tableId?',
       name: 'menu',
       component: () => import('./views/Menu.vue'),
@@ -52,6 +58,12 @@ const router = createRouter({
           name: 'users',
           component: () => import('./views/UserManagement.vue'),
           meta: { roles: ['MANAGER'] }
+        },
+        {
+          path: 'settings',
+          name: 'settings',
+          component: () => import('./views/Settings.vue'),
+          meta: { roles: ['MANAGER'] }
         }
       ]
     },
@@ -65,7 +77,7 @@ const router = createRouter({
 // Role-Based Access Control (RBAC) Navigation Guard
 router.beforeEach((to, _from, next) => {
   // 1. If route is public or explicitly allows all users (e.g. /menu/:tableId?), permit access immediately
-  if (to.meta?.public || to.meta?.allowAll || to.path.startsWith('/menu') || to.path === '/') {
+  if (to.meta?.public || to.meta?.allowAll || to.path.startsWith('/menu') || to.path.startsWith('/t/') || to.path === '/') {
     return next()
   }
 
